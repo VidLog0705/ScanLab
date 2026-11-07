@@ -53,6 +53,8 @@ struct EngineStatus {
     var displayZoom: Double = 1
     var decodeMs: Double = -1
     var labelConfidence: Float?
+    /// 本帧检出的全部矩形：`个数: 面积/长宽比 …  → 选中的那个`
+    var rectInfo: String = "—"
     var distance: Double?
     var chosenLens: Double?
     var preZoomed = false
@@ -125,6 +127,7 @@ final class ScanEngine: NSObject {
     private var lastFocusPoint: CGPoint?
     private var lastDistance: Double?
     private var lastDecodeMs: Double = -1
+    private var lastRectInfo = "—"
     private var lastPayload = ""
     private var lastPayloadAt: CFTimeInterval = 0
 
@@ -410,6 +413,7 @@ final class ScanEngine: NSObject {
         s.chosenLens = chosenLens
         s.distance = lastDistance
         s.labelConfidence = smoothedConfidence
+        s.rectInfo = lastRectInfo
         s.fps = fps
         s.frameW = frameW
         s.frameH = frameH
@@ -489,11 +493,13 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         var rectRequest: VNDetectRectanglesRequest?
         if flags.labelDetect {
             let request = VNDetectRectanglesRequest()
-            request.maximumObservations = 4
-            request.minimumAspectRatio = 0.3
-            request.maximumAspectRatio = 3.0
-            request.minimumSize = 0.3
-            request.minimumConfidence = 0.6
+            // 放宽检出（门槛太高会连面单一起漏掉）、收紧形状（面单就是 1.5 左右的长方形）。
+            // 挑哪个交给 pickLabel，不要让 Vision 的置信度排序替我们决定。
+            request.maximumObservations = 8
+            request.minimumAspectRatio = 0.5
+            request.maximumAspectRatio = 2.6
+            request.minimumSize = 0.15
+            request.minimumConfidence = 0.5
             request.quadratureTolerance = 30
             rectRequest = request
             requests.append(request)
@@ -520,25 +526,31 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         var labelBox: CGRect?
         var labelConfidence: Float?
         if let rectRequest {
-            let candidates = (rectRequest.results ?? []).map { r -> (CGRect, Float) in
+            let all = (rectRequest.results ?? []).map { r -> (CGRect, Float) in
                 (Self.toDisplayed(r.boundingBox, region: region, width: width, height: height),
                  r.confidence)
             }
-            // 有单号就选包住单号的那个框（同一张面单上可能有多个矩形：地址框、条码框）。
-            // 没单号就选面积最大的。
-            let picked: (CGRect, Float)?
+            // 候选全打到屏幕上（面积/长宽比）。**面单不在里面时，再怎么挑都没用** ——
+            // 这个列表就是判据：0 个 = Vision 根本没看见面单这块矩形。
+            var info = all.isEmpty ? "0 个" : "\(all.count) 个: "
+                + all.map { Self.describe($0.0) }.joined(separator: "  ")
+
+            // 有单号就优先在「包住单号」的那几个里挑，没有就全体里挑。
+            var pool = all
             if let hit = barcodes.first {
-                picked = candidates
-                    .filter { $0.0.insetBy(dx: -0.02, dy: -0.02).contains(CGPoint(x: hit.1.midX, y: hit.1.midY)) }
-                    .max { $0.0.width * $0.0.height < $1.0.width * $1.0.height }
-                    ?? candidates.max { $0.0.width * $0.0.height < $1.0.width * $1.0.height }
-            } else {
-                picked = candidates.max { $0.0.width * $0.0.height < $1.0.width * $1.0.height }
+                let containing = all.filter {
+                    $0.0.insetBy(dx: -0.02, dy: -0.02).contains(CGPoint(x: hit.1.midX, y: hit.1.midY))
+                }
+                if !containing.isEmpty { pool = containing }
             }
-            if let picked {
+            if let picked = Self.pickLabel(from: pool) {
                 labelBox = picked.0
                 labelConfidence = picked.1
+                info += "  → " + Self.describe(picked.0)
             }
+            lastRectInfo = info
+        } else {
+            lastRectInfo = "未开"
         }
 
         // 5) 平滑（面单在动，逐帧跳会看瞎）
@@ -656,6 +668,44 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     // MARK: - 坐标
+
+    // MARK: - 挑面单
+
+    /// 面单长边/短边 ≈ 1.5（100×150mm 的电子面单）。放宽到 1.15~2.6：斜着拍会被拉长。
+    /// 用「长/短」而不是「宽/高」，这样和面单是横是竖无关。
+    private static let labelAspectRange: ClosedRange<Double> = 1.15...2.6
+
+    /// 面单很少占画面一半以上；占这么大的，通常就是**整个包裹**。
+    /// 2026-11-07 真机：绿框框住的是整箱 —— 因为当时按「面积最大」挑，箱子当然最大。
+    private static let labelMaxArea: Double = 0.55
+
+    private static func aspect(_ rect: CGRect) -> Double {
+        let long = Double(max(rect.width, rect.height))
+        let short = Double(min(rect.width, rect.height))
+        return short > 0 ? long / short : 0
+    }
+
+    /// 面积 / 长宽比，给屏幕上的候选列表用。
+    private static func describe(_ rect: CGRect) -> String {
+        String(format: "%.2f/%.1f", Double(rect.width * rect.height), aspect(rect))
+    }
+
+    /// 从候选里挑面单。
+    ///
+    /// ⚠️ **不能只挑面积最大的** —— 整箱包裹也是一个矩形，而且永远比面单大。
+    /// 先按「像面单」（长宽比 + 面积占比）过滤，再在里面挑最大的：
+    /// 这样拿到的是面单本体，而不是面单里更小的条码块，也不是外面那个箱子。
+    private static func pickLabel(from pool: [(CGRect, Float)]) -> (CGRect, Float)? {
+        let labelLike = pool.filter {
+            labelAspectRange.contains(aspect($0.0))
+                && Double($0.0.width * $0.0.height) <= labelMaxArea
+        }
+        if let best = labelLike.max(by: { $0.0.width * $0.0.height < $1.0.width * $1.0.height }) {
+            return best
+        }
+        // 一个都不像：宁可用大的那个也别让绿框消失，但候选列表已经把事情说清楚了。
+        return pool.max(by: { $0.0.width * $0.0.height < $1.0.width * $1.0.height })
+    }
 
     /// Vision 的框（裁剪图、左下原点）→ 整幅画面归一化、**左上原点**。
     private static func toDisplayed(

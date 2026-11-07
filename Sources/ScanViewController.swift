@@ -314,6 +314,8 @@ final class ScanViewController: UIViewController {
         if s.preZoomed { label += "  预缩中" }
         label += "  空转 \(s.misses) 轮"
         lines.append(label)
+        // 候选矩形：面单不在这个列表里，绿框/对焦/选镜全都无从谈起
+        lines.append("矩形 " + s.rectInfo)
 
         if !records.isEmpty {
             lines.append("\(records.count) 件  " + MetricsStore.summary(records))
