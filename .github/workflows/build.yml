@@ -1,0 +1,55 @@
+name: ScanLab .ipa
+
+# ─────────────────────────────────────────────────────────────
+# 手动触发，出未签名 .ipa 给 Sideloadly 装真机。
+#
+# 公开仓 → Actions 不占私有额度（macOS runner 的 10 倍计费在这里不花钱）。
+# 产物固定发到 Release 标签 `scanlab`，每次覆盖，下载页永远只有最新那一份。
+# ─────────────────────────────────────────────────────────────
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: scanlab
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build .ipa
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 xcodegen
+        run: brew install xcodegen
+
+      - name: 显示 Xcode 版本
+        run: xcodebuild -version
+
+      - name: 编译并打包
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 上传 .ipa（发到 Release）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IPA=build/ScanLab-unsigned.ipa
+          [ -f "$IPA" ] || { echo "找不到 $IPA"; exit 1; }
+          ls -lh "$IPA"
+
+          TAG=scanlab
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --prerelease \
+              --title "ScanLab 扫码实验包（未签名）" \
+              --notes "免费 Apple ID 签的 7 天过期，过期重装即可。"
+          gh release upload "$TAG" "$IPA" --clobber
+          echo "下载页：${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"

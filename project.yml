@@ -1,0 +1,40 @@
+# ScanLab —— EviLog 扫码实验包（只测扫码链路，不含录制/水印/授权）
+#
+# 用 XcodeGen 生成工程：CI 里 `xcodegen generate` 后直接 xcodebuild。
+# 不手写 .xcodeproj —— 这份工程在 Windows 上没法用 Xcode 打开，手写 pbxproj 出错率太高。
+name: ScanLab
+
+options:
+  bundleIdPrefix: com.evilog
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+
+targets:
+  ScanLab:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.evilog.scanlab
+        PRODUCT_NAME: ScanLab
+        INFOPLIST_FILE: Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: "NO"
+        # 与正式端一致：无签名出包，Sideloadly 再签
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+
+# 显式写一个 scheme：不写的话 xcodebuild -scheme 找不到目标。
+schemes:
+  ScanLab:
+    build:
+      targets:
+        ScanLab: all
