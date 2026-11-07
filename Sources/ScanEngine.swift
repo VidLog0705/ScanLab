@@ -150,11 +150,20 @@ final class ScanEngine: NSObject {
     static let scanSpan: CGFloat = 0.70
     /// 变焦速度（倍/秒）。与正式端 `zoomRampRate` 一致：0.5 档 = 0.5 秒，即「缓进缓退」。
     static let zoomRampRate: Float = 1.0
-    /// 预缩放推一档的倍数（相对当前底）—— **不能用加法**：底在 0.5x 时加 0.5 等于 1.0x，
-    /// 那是把镜头换回主摄，近距离又糊了，正好把 M4 的收益抵消掉。
-    static let preZoomFactor: Double = 1.6
+    /// 预缩放的目标：**让面单长边占到画面这一维的多少**。
+    ///
+    /// 不再用「乘 1.6」这种固定步长 —— 2026-11-07 真机量出来：80cm、1x 时面单只占 14%，
+    /// 条码那一条在 1080 宽的画面里只剩 ~100 像素，Code 128 稳定解要 ≥160 像素。
+    /// 乘 1.6 只推到 160，正好压在门槛上，等于没推。固定步长在**不知道距离**时没有意义。
+    ///
+    /// 0.5 是这么来的：面单占一半画面时，长 100mm 的条码 ≈ 1080×0.33 ≈ 350 像素，
+    /// 约 4 像素/模块 —— 留了一倍余量。
+    static let preZoomTargetFill: Double = 0.5
     /// 预缩放最多推到多少（界面倍率）。
-    static let preZoomCeiling: Double = 3.0
+    static let preZoomCeiling: Double = 4.0
+    /// 推近的速度（倍/秒）。**故意比 [zoomRampRate] 快**：这段是「主动推近」，
+    /// 不是录像开头那次缓动。1x→3.6x 用 3.0 只需 0.87 秒。
+    static let preZoomRampRate: Float = 3.0
 
     // MARK: - 生命周期
 
@@ -356,7 +365,7 @@ final class ScanEngine: NSObject {
     }
 
     /// 推到某个**界面**倍率。已经是这个值就什么都不做。
-    private func rampTo(_ display: Double) {
+    private func rampTo(_ display: Double, rate: Float = ScanEngine.zoomRampRate) {
         guard let device else { return }
         let multiplier = self.multiplier
         let internalFactor = LensMath.toInternal(display, multiplier: multiplier)
@@ -368,7 +377,7 @@ final class ScanEngine: NSObject {
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
-            device.ramp(toVideoZoomFactor: CGFloat(clamped), withRate: Self.zoomRampRate)
+            device.ramp(toVideoZoomFactor: CGFloat(clamped), withRate: rate)
         } catch {
             // 变焦失败不影响识别，只是少一个实验变量。
         }
@@ -654,10 +663,19 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         }
 
-        // 7) 预缩放：连续两轮没读到、面单又在框里 ⇒ 推近一档
-        if flags.preZoom, cycleStart != nil, !preZoomActive, misses >= 2, smoothedBox != nil {
+        // 7) 预缩放：连续两轮没读到、面单又在框里 ⇒ 推到「面单占画面 preZoomTargetFill」
+        //
+        // 步长是从**当前看到的占比**反算的，不是固定倍数：80cm 和 40cm 需要推的量差一倍，
+        // 固定倍数在其中一个距离上必然不够或过头。
+        if flags.preZoom, cycleStart != nil, !preZoomActive, misses >= 2, let box = smoothedBox {
             preZoomActive = true
-            rampTo(min((chosenLens ?? 1.0) * Self.preZoomFactor, Self.preZoomCeiling))
+            let fill = Double(max(box.width, box.height))
+            let current = LensMath.toDisplay(Double(device?.videoZoomFactor ?? 1), multiplier: multiplier)
+            let need = fill > 0.02 ? Self.preZoomTargetFill / fill : Self.preZoomCeiling
+            // 推近要**快**：缓进缓退是给录像开头的，用在这里等于把省下来的时间
+            // 又还给缓动（80cm 推到 3.6x 按 1.0 倍/秒要走 2.6 秒）。退回去仍然缓。
+            rampTo(min(max(current * need, current), Self.preZoomCeiling),
+                   rate: Self.preZoomRampRate)
         }
 
         // 8) 对焦打到面单中心（动够多才重设，否则相机会一直重新对焦、画面发飘）
