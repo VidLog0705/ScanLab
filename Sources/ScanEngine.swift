@@ -56,6 +56,8 @@ struct EngineStatus {
     var labelConfidence: Float?
     /// 本帧检出的全部矩形：`个数: 面积/长宽比 …  → 选中的那个`
     var rectInfo: String = "—"
+    /// 条码那一路检出的观察：`0 个` / `Code128` / `ITF14无正文`
+    var barcodeInfo: String = "—"
     /// Vision 上一次 `perform` 抛的错。空 = 没抛。
     /// ⚠️ 与「没认出码」**必须分开显示**：前者是代码/输入有问题，后者是打法问题。
     var visionError: String = ""
@@ -136,6 +138,7 @@ final class ScanEngine: NSObject {
     private var lastDistance: Double?
     private var lastDecodeMs: Double = -1
     private var lastRectInfo = "—"
+    private var lastBarcodeInfo = "—"
     private var lastVisionError = ""
     private var lastThumbAt: CFTimeInterval = 0
     private var lastPayload = ""
@@ -439,6 +442,7 @@ final class ScanEngine: NSObject {
         s.distance = lastDistance
         s.labelConfidence = smoothedConfidence
         s.rectInfo = lastRectInfo
+        s.barcodeInfo = lastBarcodeInfo
         s.visionError = lastVisionError
         s.fps = fps
         s.frameW = frameW
@@ -507,14 +511,14 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                 .transformed(by: CGAffineTransform(translationX: -region.minX, y: -region.minY))
             : full
 
-        // 2) 请求：条码 + 面单矩形
+        // 2) 请求：条码
         let barcodeRequest = VNDetectBarcodesRequest()
-        barcodeRequest.symbologies = [.code128]
+        // 正式端只开 code128。这里**故意放宽**：如果这台机器上的面单其实不是 code128，
+        // 正式端也会读不到 —— 那是一个必须知道的结论，而放宽码制是唯一能问出来的办法。
+        barcodeRequest.symbologies = [.code128, .code39, .code93, .itf14, .ean13]
         if let revision = VNDetectBarcodesRequest.supportedRevisions.last {
             barcodeRequest.revision = revision
         }
-
-        var requests: [VNRequest] = [barcodeRequest]
 
         var rectRequest: VNDetectRectanglesRequest?
         if flags.labelDetect {
@@ -528,13 +532,18 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             request.minimumConfidence = 0.5
             request.quadratureTolerance = 30
             rectRequest = request
-            requests.append(request)
         }
 
-        let handler = VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
+        // ⚠️ 条码这一路**单独一次 perform、单独一个 handler**：正式端就是一次一个请求。
+        // 两个请求塞进同一次 perform 是我自己加的变化，读不到码时它会变成无法排除的变量。
+        // 另外不裁框时走 `cvPixelBuffer`（也是正式端那条路），把 CIImage 这一层也摘掉。
+        let barcodeHandler: VNImageRequestHandler = cropping
+            ? VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
+            : VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+
         let started = CACurrentMediaTime()
         do {
-            try handler.perform(requests)
+            try barcodeHandler.perform([barcodeRequest])
             lastVisionError = ""
         } catch {
             // ⚠️ 不许静默：**识码器整个抛异常**与「图看了但没认出码」是两件事，
@@ -557,15 +566,33 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         attempts += 1
 
         // 3) 条码（results 已经是 [VNBarcodeObservation]，不用再转型）
-        let barcodes: [(String, CGRect)] = (barcodeRequest.results ?? []).compactMap { bc in
+        let observations = barcodeRequest.results ?? []
+        let barcodes: [(String, CGRect)] = observations.compactMap { bc in
             guard let payload = bc.payloadStringValue, !payload.isEmpty else { return nil }
             return (payload, Self.toDisplayed(bc.boundingBox, region: region, width: width, height: height))
         }
+        // 看见了码但没解出正文，和「根本没见过码」是两件事 —— 分开显示。
+        lastBarcodeInfo = observations.isEmpty
+            ? "0 个"
+            : observations.map { ob in
+                let name = ob.symbology.rawValue
+                    .replacingOccurrences(of: "VNBarcodeSymbology", with: "")
+                return (ob.payloadStringValue?.isEmpty == false) ? name : name + "无正文"
+            }.joined(separator: " ")
 
-        // 4) 面单
+        // 4) 面单（单独一次 perform，见上）
         var labelBox: CGRect?
         var labelConfidence: Float?
         if let rectRequest {
+            let rectHandler: VNImageRequestHandler = cropping
+                ? VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
+                : VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+            var rectError: String?
+            do {
+                try rectHandler.perform([rectRequest])
+            } catch {
+                rectError = String(describing: error)
+            }
             let all = (rectRequest.results ?? []).map { r -> (CGRect, Float) in
                 (Self.toDisplayed(r.boundingBox, region: region, width: width, height: height),
                  r.confidence)
@@ -588,7 +615,7 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                 labelConfidence = picked.1
                 info += "  → " + Self.describe(picked.0)
             }
-            lastRectInfo = info
+            lastRectInfo = rectError.map { "抛错 " + $0 } ?? info
         } else {
             lastRectInfo = "未开"
         }

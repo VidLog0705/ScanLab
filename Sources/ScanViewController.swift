@@ -330,6 +330,7 @@ final class ScanViewController: UIViewController {
         label += "  空转 \(s.misses) 轮"
         lines.append(label)
         // 候选矩形：面单不在这个列表里，绿框/对焦/选镜全都无从谈起
+        lines.append("条码 " + s.barcodeInfo)
         lines.append("矩形 " + s.rectInfo)
         if !s.visionError.isEmpty {
             lines.append("⚠️ 识码抛错 " + s.visionError)
