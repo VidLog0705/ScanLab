@@ -156,7 +156,14 @@ final class ScanEngine: NSObject {
             }
 
             self.session.beginConfiguration()
-            self.session.sessionPreset = .hd1280x720
+            // ⚠️ 必须和正式端同一个档（正式端默认 1080P）。720P 的像素密度只有 1/2.25，
+            // 同一张面单同样距离下条码模块的像素数不够 ⇒ **一个字都读不出来**，
+            // 那就不是「慢」而是「零」，A/B 连基线都没有。2026-11-07 真机「全关也读不到」。
+            self.session.sessionPreset = .hd1920x1080
+            if !self.session.canSetSessionPreset(.hd1920x1080) {
+                // 不静默降级：屏幕上得看得见这一条，否则测出来的是另一台机器的行为。
+                self.reportFailure("这台设备设不上 1080P，分辨率不是正式端那一档")
+            }
 
             do {
                 let input = try AVCaptureDeviceInput(device: found)
