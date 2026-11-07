@@ -14,6 +14,9 @@ final class ScanViewController: UIViewController {
     private let resultLabel = UILabel()
     private let problemLabel = UILabel()
     private let startButton = UIButton(type: .system)
+    private let exportButton = UIButton(type: .system)
+    private let clearButton = UIButton(type: .system)
+    private let actions = UIStackView()
     private let scroll = UIScrollView()
     private let row = UIStackView()
 
@@ -39,6 +42,7 @@ final class ScanViewController: UIViewController {
         view.backgroundColor = .black
         buildUI()
         renderToggleStates()
+        updateActions()
 
         let fails = LensMath.check()
         problemLabel.text = fails.isEmpty ? "" : "⚠️ 换算表自检失败：\n" + fails.joined(separator: "\n")
@@ -171,7 +175,8 @@ final class ScanViewController: UIViewController {
 
         row.axis = .horizontal
         row.spacing = 8
-        row.alignment = .center
+        // fill 而不是 center：让开关按钮撑满整行高度，手指好按（原来只有 ~30pt 高）
+        row.alignment = .fill
         row.translatesAutoresizingMaskIntoConstraints = false
         scroll.showsHorizontalScrollIndicator = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -182,13 +187,22 @@ final class ScanViewController: UIViewController {
             makeToggle("裁框", key: \.cropToScanSpan),
             makeToggle("绿框", key: \.labelDetect),
             makeToggle("对焦", key: \.focusOnLabel),
-            makeToggle("预缩放", key: \.preZoom),
-            makeToggle("选镜头", key: \.lensSelect),
-            makeAction("导出", action: #selector(exportCSV)),
-            makeAction("清零", action: #selector(clearRecords)),
+            makeToggle("预缩", key: \.preZoom),
+            makeToggle("选镜", key: \.lensSelect),
         ] {
             row.addArrangedSubview(button)
         }
+
+        // 【导出】【清零】不放滚动条里 —— 竖屏时它们原本被挤到屏幕右边看不见，
+        // 看着就像「点了没反应」。挪到底部左侧，永远在眼前。
+        configureAction(exportButton, title: "导出", action: #selector(exportCSV))
+        configureAction(clearButton, title: "清零", action: #selector(clearRecords))
+        actions.axis = .horizontal
+        actions.spacing = 8
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        actions.addArrangedSubview(exportButton)
+        actions.addArrangedSubview(clearButton)
+        view.addSubview(actions)
 
         let safe = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -209,10 +223,15 @@ final class ScanViewController: UIViewController {
             startButton.widthAnchor.constraint(equalToConstant: 168),
             startButton.heightAnchor.constraint(equalToConstant: 56),
 
+            actions.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12),
+            actions.centerYAnchor.constraint(equalTo: startButton.centerYAnchor),
+            actions.heightAnchor.constraint(equalToConstant: 44),
+            actions.trailingAnchor.constraint(lessThanOrEqualTo: startButton.leadingAnchor, constant: -8),
+
             scroll.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 8),
             scroll.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -8),
             scroll.bottomAnchor.constraint(equalTo: startButton.topAnchor, constant: -8),
-            scroll.heightAnchor.constraint(equalToConstant: 40),
+            scroll.heightAnchor.constraint(equalToConstant: 44),
 
             row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 4),
             row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -4),
@@ -240,16 +259,23 @@ final class ScanViewController: UIViewController {
         return button
     }
 
-    private func makeAction(_ title: String, action: Selector) -> UIButton {
-        let button = UIButton(type: .system)
+    private func configureAction(_ button: UIButton, title: String, action: Selector) {
         button.setTitle(title, for: .normal)
-        button.titleLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        button.titleLabel?.font = .monospacedSystemFont(ofSize: 15, weight: .semibold)
         button.setTitleColor(.white, for: .normal)
-        button.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        button.setTitleColor(.lightGray, for: .disabled)
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.55)
         button.layer.cornerRadius = 8
-        button.contentEdgeInsets = UIEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
+        button.contentEdgeInsets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         button.addTarget(self, action: action, for: .touchUpInside)
-        return button
+    }
+
+    /// 没数据时把【导出】置灰并写上件数 —— 灰的按钮点不动是「看得出来」的，
+    /// 而静默 `return` 在操作员眼里等于「按钮坏了」（2026-11-07 就是这么被报的）。
+    private func updateActions() {
+        exportButton.setTitle(records.isEmpty ? "导出" : "导出 \(records.count)", for: .normal)
+        exportButton.isEnabled = !records.isEmpty
+        clearButton.isEnabled = !records.isEmpty
     }
 
     private func renderToggleStates() {
@@ -345,9 +371,12 @@ final class ScanViewController: UIViewController {
     }
 
     @objc private func exportCSV() {
-        guard !records.isEmpty else { return }
+        guard !records.isEmpty else {
+            resultLabel.text = "还没有数据：先按【本件开始】打几件"
+            return
+        }
         guard let url = MetricsStore.write(records) else {
-            showProblem("写不出 CSV，检查存储空间")
+            resultLabel.text = "写不出 CSV，检查存储空间"
             return
         }
         let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
@@ -358,6 +387,8 @@ final class ScanViewController: UIViewController {
 
     @objc private func clearRecords() {
         records.removeAll()
+        resultLabel.text = nil
+        updateActions()
         renderInfo()
     }
 
@@ -387,6 +418,7 @@ extension ScanViewController: ScanEngineDelegate {
                 labelConfidence: hit.confidence))
             pendingDate = nil
             startButton.setTitle("本件开始", for: .normal)
+            updateActions()
         }
     }
 
