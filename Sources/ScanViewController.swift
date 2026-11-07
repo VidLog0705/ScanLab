@@ -313,7 +313,7 @@ final class ScanViewController: UIViewController {
     }
 
     private func refreshGeometry() {
-        guard let previewLayer else { return }
+        guard previewLayer != nil else { return }
         overlay.viewfinderRect = engine.flags.cropToScanSpan
             ? (screenRect(viewfinderRect) ?? .zero)
             : .zero

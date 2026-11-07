@@ -510,11 +510,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         attempts += 1
 
-        // 3) 条码
-        let barcodes: [(String, CGRect)] = (barcodeRequest.results ?? []).compactMap { obs in
-            guard let bc = obs as? VNBarcodeObservation,
-                  let payload = bc.payloadStringValue,
-                  !payload.isEmpty else { return nil }
+        // 3) 条码（results 已经是 [VNBarcodeObservation]，不用再转型）
+        let barcodes: [(String, CGRect)] = (barcodeRequest.results ?? []).compactMap { bc in
+            guard let payload = bc.payloadStringValue, !payload.isEmpty else { return nil }
             return (payload, Self.toDisplayed(bc.boundingBox, region: region, width: width, height: height))
         }
 
@@ -522,10 +520,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         var labelBox: CGRect?
         var labelConfidence: Float?
         if let rectRequest {
-            let candidates = (rectRequest.results ?? []).compactMap { obs -> (CGRect, Float)? in
-                guard let r = obs as? VNRectangleObservation else { return nil }
-                return (Self.toDisplayed(r.boundingBox, region: region, width: width, height: height),
-                        r.confidence)
+            let candidates = (rectRequest.results ?? []).map { r -> (CGRect, Float) in
+                (Self.toDisplayed(r.boundingBox, region: region, width: width, height: height),
+                 r.confidence)
             }
             // 有单号就选包住单号的那个框（同一张面单上可能有多个矩形：地址框、条码框）。
             // 没单号就选面积最大的。
