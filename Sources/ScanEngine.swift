@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import UIKit
 import Vision
 
 /// 实验开关。界面上一排按钮直接拨这些值 —— 同一个包就能做 A/B，
@@ -55,6 +56,9 @@ struct EngineStatus {
     var labelConfidence: Float?
     /// 本帧检出的全部矩形：`个数: 面积/长宽比 …  → 选中的那个`
     var rectInfo: String = "—"
+    /// Vision 上一次 `perform` 抛的错。空 = 没抛。
+    /// ⚠️ 与「没认出码」**必须分开显示**：前者是代码/输入有问题，后者是打法问题。
+    var visionError: String = ""
     var distance: Double?
     var chosenLens: Double?
     var preZoomed = false
@@ -69,6 +73,10 @@ protocol ScanEngineDelegate: AnyObject {
     func engine(_ engine: ScanEngine, didSeeLabel box: CGRect?, confidence: Float?)
     /// 焦点十字该画在哪（画面归一化、原点左上）；nil = 不画。
     func engine(_ engine: ScanEngine, didMoveFocusTo point: CGPoint?)
+    /// **送进 Vision 的那张图的缩略图**（每 0.5 秒一张）。
+    /// 画出来是为了让「识码器到底看到什么」在屏幕上有证据 —— 不然「没读到码」
+    /// 到底是图不对、还是图对了但太小，只能靠猜。
+    func engine(_ engine: ScanEngine, didSeeVisionFrame image: UIImage?)
     func engine(_ engine: ScanEngine, didUpdate status: EngineStatus)
 }
 
@@ -128,6 +136,8 @@ final class ScanEngine: NSObject {
     private var lastDistance: Double?
     private var lastDecodeMs: Double = -1
     private var lastRectInfo = "—"
+    private var lastVisionError = ""
+    private var lastThumbAt: CFTimeInterval = 0
     private var lastPayload = ""
     private var lastPayloadAt: CFTimeInterval = 0
 
@@ -243,7 +253,15 @@ final class ScanEngine: NSObject {
             if device.isLowLightBoostSupported {
                 device.automaticallyEnablesLowLightBoostWhenAvailable = true
             }
-            device.videoZoomFactor = 1
+            // ⚠️ `videoZoomFactor` 是**内部**口径：虚拟多摄上 1.0 是**超广角 0.5x**，
+            // 内部 2.0 才是界面上的 1x（正式端 2026-10-20 真机点出来的，
+            // 见 CameraSegmentRecorder.swift `displayZoomMultiplier` 那段）。
+            // 这里直接写 1 等于一开机就把镜头推到最广 —— 面单在画面里只有一半大，
+            // 条码模块的像素数跟着砍半。起步要和正式端一样是 1x。
+            let startZoom = LensMath.toInternal(1.0, multiplier: multiplier)
+            device.videoZoomFactor = min(
+                max(startZoom, Double(device.minAvailableVideoZoomFactor)),
+                Double(device.maxAvailableVideoZoomFactor))
         } catch {
             reportFailure("相机参数设不上：\(error.localizedDescription)")
         }
@@ -421,6 +439,7 @@ final class ScanEngine: NSObject {
         s.distance = lastDistance
         s.labelConfidence = smoothedConfidence
         s.rectInfo = lastRectInfo
+        s.visionError = lastVisionError
         s.fps = fps
         s.frameW = frameW
         s.frameH = frameH
@@ -516,10 +535,24 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         let started = CACurrentMediaTime()
         do {
             try handler.perform(requests)
+            lastVisionError = ""
         } catch {
-            // Vision 偶发抛错不致命，这一轮就当没读到。
+            // ⚠️ 不许静默：**识码器整个抛异常**与「图看了但没认出码」是两件事，
+            // 前者要改代码，后者是打法问题。吞掉之后两者在屏幕上长得一模一样 ——
+            // 正式端同一处也是这么要求的（CameraSegmentRecorder 的 lastBarcodeError）。
+            lastVisionError = String(describing: error)
         }
         lastDecodeMs = (CACurrentMediaTime() - started) * 1000
+
+        // 每 0.5 秒把「送进 Vision 的那张图」缩一张给界面 —— 判断依据，不是装饰。
+        if now - lastThumbAt > 0.5 {
+            lastThumbAt = now
+            let thumb = Self.thumbnail(of: cropped)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.delegate?.engine(self, didSeeVisionFrame: thumb)
+            }
+        }
 
         attempts += 1
 
@@ -723,6 +756,22 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         let w = raw.width * region.width / width
         let h = raw.height * region.height / height
         return CGRect(x: x, y: 1 - (y + h), width: w, height: h)
+    }
+
+    // MARK: - 缩略图
+
+    /// 渲染 CIImage 要用同一个 CIContext：每次新建代价很大，而这个只做调试显示。
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
+    /// 把 CIImage 缩成一张小图给界面看。失败给 nil（界面上就是空白，不会崩）。
+    private static func thumbnail(of image: CIImage, maxSide: CGFloat = 200) -> UIImage? {
+        let extent = image.extent
+        guard extent.width > 1, extent.height > 1,
+              extent.width.isFinite, extent.height.isFinite else { return nil }
+        let scale = maxSide / max(extent.width, extent.height)
+        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = ciContext.createCGImage(small, from: small.extent) else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     private static func lerp(_ a: CGRect, _ b: CGRect, _ t: CGFloat) -> CGRect {

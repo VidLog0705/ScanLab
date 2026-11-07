@@ -13,6 +13,9 @@ final class ScanViewController: UIViewController {
     private let infoLabel = UILabel()
     private let resultLabel = UILabel()
     private let problemLabel = UILabel()
+    /// 送进 Vision 的那张图（缩略）。读不到码时先看它：图不对就是相机/裁剪的问题，
+    /// 图对了才轮得到怀疑分辨率、对焦、码制。
+    private let visionView = UIImageView()
     private let startButton = UIButton(type: .system)
     private let exportButton = UIButton(type: .system)
     private let clearButton = UIButton(type: .system)
@@ -204,8 +207,20 @@ final class ScanViewController: UIViewController {
         actions.addArrangedSubview(clearButton)
         view.addSubview(actions)
 
+        visionView.contentMode = .scaleAspectFit
+        visionView.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        visionView.layer.borderWidth = 1
+        visionView.layer.borderColor = UIColor.white.withAlphaComponent(0.6).cgColor
+        visionView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(visionView)
+
         let safe = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
+            visionView.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12),
+            visionView.centerYAnchor.constraint(equalTo: safe.centerYAnchor),
+            visionView.widthAnchor.constraint(equalToConstant: 100),
+            visionView.heightAnchor.constraint(equalToConstant: 133),
+
             infoLabel.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
             infoLabel.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12),
             infoLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.75),
@@ -316,6 +331,9 @@ final class ScanViewController: UIViewController {
         lines.append(label)
         // 候选矩形：面单不在这个列表里，绿框/对焦/选镜全都无从谈起
         lines.append("矩形 " + s.rectInfo)
+        if !s.visionError.isEmpty {
+            lines.append("⚠️ 识码抛错 " + s.visionError)
+        }
 
         if !records.isEmpty {
             lines.append("\(records.count) 件  " + MetricsStore.summary(records))
@@ -432,6 +450,10 @@ extension ScanViewController: ScanEngineDelegate {
     func engine(_ engine: ScanEngine, didMoveFocusTo point: CGPoint?) {
         focusPoint = point
         refreshGeometry()
+    }
+
+    func engine(_ engine: ScanEngine, didSeeVisionFrame image: UIImage?) {
+        visionView.image = image
     }
 
     func engine(_ engine: ScanEngine, didUpdate status: EngineStatus) {
