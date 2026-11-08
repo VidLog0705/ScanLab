@@ -45,6 +45,7 @@ final class ScanViewController: UIViewController {
         view.backgroundColor = .black
         buildUI()
         renderToggleStates()
+        syncStartButton()
         updateActions()
 
         let fails = LensMath.check()
@@ -91,7 +92,7 @@ final class ScanViewController: UIViewController {
         // 先把角打上再开会话：start() 里会用同一个 angle 配数据输出。
         applyOrientation(force: true)
         engine.start()
-        startButton.isEnabled = true
+        syncStartButton()
 
         // 会话起得来之后连接才有，这时补打一次（多半是这次才真正生效）。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -187,6 +188,7 @@ final class ScanViewController: UIViewController {
         view.addSubview(scroll)
 
         for button in [
+            makeToggle("连续", key: \.continuous),
             makeToggle("裁框", key: \.cropToScanSpan),
             makeToggle("绿框", key: \.labelDetect),
             makeToggle("对焦", key: \.focusOnLabel),
@@ -267,7 +269,10 @@ final class ScanViewController: UIViewController {
             var flags = self.engine.flags
             flags[keyPath: key].toggle()
             self.engine.flags = flags
+            // 连续扫的相位与倍率都归零：中途拨开关不能留一个「推近中」的状态在跑。
+            self.engine.resetContinuous()
             self.renderToggleStates()
+            self.syncStartButton()
             self.refreshGeometry()
         }, for: .touchUpInside)
         toggles.append((title, key, button))
@@ -283,6 +288,18 @@ final class ScanViewController: UIViewController {
         button.layer.cornerRadius = 8
         button.contentEdgeInsets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         button.addTarget(self, action: action, for: .touchUpInside)
+    }
+
+    /// 连续扫时【本件开始】没有意义 —— 自动开件，按了只会插进去一次手动计时。
+    /// **置灰而不是藏起来**：藏了会让人以为界面少了东西。
+    private func syncStartButton() {
+        if engine.flags.continuous {
+            startButton.setTitle("连续扫中", for: .normal)
+            startButton.isEnabled = false
+        } else {
+            startButton.setTitle(pendingDate == nil ? "本件开始" : "重新开始", for: .normal)
+            startButton.isEnabled = started
+        }
     }
 
     /// 没数据时把【导出】置灰并写上件数 —— 灰的按钮点不动是「看得出来」的，
@@ -329,6 +346,15 @@ final class ScanViewController: UIViewController {
         if s.preZoomed { label += "  预缩中" }
         label += "  空转 \(s.misses) 轮"
         lines.append(label)
+
+        // 连续扫这一行是**判据**：占比决定推多少，上限决定推到底有没有用。
+        if engine.flags.continuous {
+            var line = String(
+                format: "连续 %@  占比 %.2f  推 %.2fx  上限 %.2fx",
+                s.phase, s.fill, s.pushZoom, s.ceiling)
+            if s.capped { line += "  ⚠️推到顶" }
+            lines.append(line)
+        }
         // 候选矩形：面单不在这个列表里，绿框/对焦/选镜全都无从谈起
         lines.append("条码 " + s.barcodeInfo)
         lines.append("矩形 " + s.rectInfo)
@@ -388,7 +414,7 @@ final class ScanViewController: UIViewController {
         pendingDate = Date()
         resultLabel.text = "计时中…"
         engine.beginCycle()
-        startButton.setTitle("重新开始", for: .normal)
+        syncStartButton()
     }
 
     @objc private func exportCSV() {
@@ -422,25 +448,34 @@ final class ScanViewController: UIViewController {
 
 extension ScanViewController: ScanEngineDelegate {
     func engine(_ engine: ScanEngine, didHit hit: ScanHit) {
-        resultLabel.text = String(format: "%@  %.0fms  %d 轮", hit.text, hit.ms, hit.attempts)
+        resultLabel.text = String(
+            format: "%@  %.0fms  %d 轮  %.2fx→%.2fx%@",
+            hit.text, hit.ms, hit.attempts, hit.zoomBefore, hit.zoom,
+            hit.capped ? "  ⚠️推到顶" : "")
 
-        if let start = pendingDate {
-            records.append(ScanRecord(
-                index: records.count + 1,
-                at: start,
-                ms: hit.ms,
-                attempts: hit.attempts,
-                text: hit.text,
-                orientation: orientationName,
-                mode: engine.flags.modeTag,
-                camName: hit.camName,
-                zoom: hit.zoom,
-                distance: hit.distance,
-                labelConfidence: hit.confidence))
-            pendingDate = nil
-            startButton.setTitle("本件开始", for: .normal)
-            updateActions()
-        }
+        // 手动模式靠【本件开始】计时；连续扫没有按钮，每一件都该落一条记录。
+        let manual = pendingDate
+        guard manual != nil || engine.flags.continuous else { return }
+
+        records.append(ScanRecord(
+            index: records.count + 1,
+            at: manual ?? Date().addingTimeInterval(-hit.ms / 1000),
+            ms: hit.ms,
+            attempts: hit.attempts,
+            text: hit.text,
+            orientation: orientationName,
+            mode: engine.flags.modeTag,
+            camName: hit.camName,
+            zoom: hit.zoom,
+            distance: hit.distance,
+            labelConfidence: hit.confidence,
+            zoomBefore: hit.zoomBefore,
+            fillBefore: hit.fillBefore,
+            fillAtHit: hit.fillAtHit,
+            capped: hit.capped))
+        pendingDate = nil
+        syncStartButton()
+        updateActions()
     }
 
     func engine(_ engine: ScanEngine, didSeeLabel box: CGRect?, confidence: Float?) {

@@ -12,10 +12,14 @@ struct ScanFlags {
     var labelDetect = true
     /// 对焦+测光打到面单中心。
     var focusOnLabel = true
-    /// 连续两轮没读到就推一档近。
+    /// 连续两轮没读到就推一档近（**只在手动模式下起作用**，见 `continuous`）。
     var preZoom = true
     /// M4：按估计距离决定用超广角还是主摄。
     var lensSelect = true
+    /// **连续扫码闭环**：面单进框 → 按占比瞬时推近 → 读到 → 保持 → 缓退回位 → 等下一件。
+    ///
+    /// 打开后 `preZoom` / `lensSelect` 自动让位（两套变焦逻辑同时在跑，倍率是谁改的都查不出来）。
+    var continuous = false
 
     /// 界面上的缩写，写进 CSV。改开关顺序不要改这里 —— 这是数据的标签。
     var modeTag: String {
@@ -23,8 +27,8 @@ struct ScanFlags {
             cropToScanSpan ? "裁" : "全",
             labelDetect ? "绿框" : "无框",
             focusOnLabel ? "对焦" : "不对焦",
-            preZoom ? "预缩放" : "无预缩",
-            lensSelect ? "选镜" : "不选镜",
+            continuous ? "连续" : (preZoom ? "预缩放" : "无预缩"),
+            lensSelect && !continuous ? "选镜" : "不选镜",
         ].joined(separator: "/")
     }
 }
@@ -39,6 +43,10 @@ struct ScanHit {
     let distance: Double?
     let zoom: Double
     let camName: String
+    let zoomBefore: Double
+    let fillBefore: Double
+    let fillAtHit: Double
+    let capped: Bool
 }
 
 /// 每 0.2 秒推一次给界面的读数。只在主线程读写。
@@ -67,6 +75,18 @@ struct EngineStatus {
     var misses = 0
     var fps: Double = 0
     var message: String = ""
+
+    // MARK: 连续扫
+    /// 相位：等面单 / 推近读 / 保持 / 回退 / 等下一件。
+    var phase: String = "—"
+    /// 当前面单长边 ÷ 取景框边长。**这就是「推多少」的唯一输入**。
+    var fill: Double = 0
+    /// 本轮推到的倍率（已经是截断之后的）。
+    var pushZoom: Double = 0
+    /// 数码变焦的物理上限（传感器长边 ÷ 视频长边）。超过它全是插值。
+    var ceiling: Double = 0
+    /// 本轮是否被上限截住了。
+    var capped = false
 }
 
 protocol ScanEngineDelegate: AnyObject {
@@ -144,6 +164,27 @@ final class ScanEngine: NSObject {
     private var lastPayload = ""
     private var lastPayloadAt: CFTimeInterval = 0
 
+    // MARK: 连续扫的相位（只在 videoQueue 里读写）
+
+    private enum Phase {
+        case idle        // 等面单进框
+        case seeking     // 已推近，等读到
+        case holding     // 读到了，保持放大
+        case restoring   // 缓退回原倍率
+        case waitingNew  // 已回位，等这件离开
+    }
+
+    private var phase: Phase = .idle
+    private var phaseAt: CFTimeInterval = 0
+    private var holdUntil: CFTimeInterval = 0
+    private var restoreEndsAt: CFTimeInterval = 0
+    /// 回位要退回到的倍率（界面口径）。**开一次会话定一次**，之后不跟着当前值漂。
+    private var baseZoom: Double = 1.0
+    private var zoomBefore: Double = 0
+    private var fillBefore: Double = 0
+    private var pushZoom: Double = 0
+    private var cappedByCeiling = false
+
     /// 识别间隔。正式端 0.3s；这里 0.25s —— 测的是「多久能读到」，粒度粗了量不准。
     static let workInterval: CFTimeInterval = 0.25
     /// 取景框边长占画面短边的比例。与正式端中档一致。
@@ -164,6 +205,30 @@ final class ScanEngine: NSObject {
     /// 推近的速度（倍/秒）。**故意比 [zoomRampRate] 快**：这段是「主动推近」，
     /// 不是录像开头那次缓动。1x→3.6x 用 3.0 只需 0.87 秒。
     static let preZoomRampRate: Float = 3.0
+
+    // MARK: 连续扫的参数
+
+    /// 推近的目标：**面单长边占取景框的比例**。
+    ///
+    /// 0.65 不是拍的，是两头夹出来的：
+    /// - **下限 ~0.56** —— 160mm 面单要占框 56% 才能让 75mm 的条码到 200 像素
+    ///   （Code128 约 120 个模块 × 1.7 像素）。低于这个数，推了也白推。
+    /// - **上限 ~0.85** —— 80cm、2.1x 时面单正好占框 80%，只剩 4cm 抖动余量。
+    ///   2026-10-22 正式端真机日志里「面单被推出框 → 回弹 → 又进来 → 再推」连转 5 轮，
+    ///   就是推得太狠。
+    ///
+    /// 0.65 落在中间，上下各有 10~20% 余量。
+    static let targetFill: Double = 0.65
+
+    /// 读到之后**保持放大**多久再往回退。这是「录像开头一段面单特写」的长度。
+    static let holdSeconds: CFTimeInterval = 2.0
+
+    /// 面单要**看不见**多久才算这一件走了（下一件的入口）。
+    /// 太短：识码器偶发漏一帧就把同一件当成新的一件；太长：换件后要干等。
+    static let rearmAbsence: CFTimeInterval = 0.75
+
+    /// 一直读不到就叫这一轮作废（面单还举着也认了 —— 总比卡在推近状态强）。
+    static let seekTimeout: CFTimeInterval = 6.0
 
     // MARK: - 生命周期
 
@@ -274,6 +339,8 @@ final class ScanEngine: NSObject {
             device.videoZoomFactor = min(
                 max(startZoom, Double(device.minAvailableVideoZoomFactor)),
                 Double(device.maxAvailableVideoZoomFactor))
+
+            videoQueue.async { [weak self] in self?.baseZoom = 1.0 }
         } catch {
             reportFailure("相机参数设不上：\(error.localizedDescription)")
         }
@@ -306,7 +373,33 @@ final class ScanEngine: NSObject {
             self.lensVotes.removeAll()
             self.lastFocusPoint = nil
             self.lastPayload = ""
+            self.resetPhase()
             self.rampTo(1.0)
+            self.publishStatus(force: true)
+        }
+    }
+
+    /// 连续扫的相位清干净。切开关、重来一件、退出时都调。
+    private func resetPhase() {
+        phase = .idle
+        phaseAt = 0
+        holdUntil = 0
+        restoreEndsAt = 0
+        zoomBefore = 0
+        fillBefore = 0
+        pushZoom = 0
+        cappedByCeiling = false
+    }
+
+    /// 界面上拨了「连续」开关：相位清零，立刻回到原倍率。
+    func resetContinuous() {
+        videoQueue.async { [weak self] in
+            guard let self else { return }
+            self.resetPhase()
+            self.cycleStart = nil
+            self.attempts = 0
+            self.misses = 0
+            self.setZoomImmediate(self.baseZoom)
             self.publishStatus(force: true)
         }
     }
@@ -383,6 +476,140 @@ final class ScanEngine: NSObject {
         }
     }
 
+    /// **瞬时**推到某个界面倍率。`rampTo` 是缓动，这个是立刻到位。
+    ///
+    /// 为什么扫描期可以瞬时：这一段发生在**读到之前**，不进录像。
+    /// 「缓进缓出」那条规矩针对的是录像画面（正式端 2026-09-22），用在这里
+    /// 等于把省下来的时间又还回去 —— 1.0 倍/秒下 1x→2.1x 要走 1.1 秒。
+    private func setZoomImmediate(_ display: Double) {
+        guard let device else { return }
+        let internalFactor = LensMath.toInternal(display, multiplier: multiplier)
+        let clamped = min(
+            max(internalFactor, Double(device.minAvailableVideoZoomFactor)),
+            Double(device.maxAvailableVideoZoomFactor))
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.cancelVideoZoomRamp()
+            device.videoZoomFactor = CGFloat(clamped)
+        } catch {
+            // 变焦失败不影响识别，只是少一个实验变量。
+        }
+    }
+
+    /// 面单长边 ÷ 取景框边长。**「该推多少」的全部输入就是这一个数。**
+    ///
+    /// 取景框是居中的正方形，边长 = 画面短边 × `scanSpan`；面单框是归一化的，
+    /// 两个方向要各自乘回像素才能比大小（正方形在归一化坐标里不是正方形）。
+    private func fillRatio(_ box: CGRect) -> Double {
+        let longPx = max(Double(box.width) * frameW, Double(box.height) * frameH)
+        let sidePx = Double(Self.scanSpan) * min(frameW, frameH)
+        return sidePx > 0 ? longPx / sidePx : 0
+    }
+
+    /// 数码变焦的**物理上限**（界面口径）：传感器长边 ÷ 视频长边。
+    ///
+    /// 竖屏 1080P 的视频横向 1080 来自传感器，而 16:9 是从 4:3 裁出来的 ——
+    /// 按**长边**比才是同一把尺子：视频 1920 ← 传感器 4032 ⇒ 2.10。
+    /// 超过这个数再推全是插值，**一个真像素都不多**。
+    ///
+    /// 取不到传感器尺寸时退回 2.1（iPhone 11 实测值）—— 宁可退到一个已知的数，
+    /// 也不要因为算不出来就一路推到 4x 把画面糊掉。
+    private var zoomCeiling: Double {
+        guard let device else { return 2.1 }
+        let still = device.activeFormat.highResolutionStillImageDimensions
+        let sensorLong = Double(max(still.width, still.height))
+        let videoLong = max(frameW, frameH)
+        guard sensorLong > 0, videoLong > 0 else { return 2.1 }
+        let ratio = sensorLong / videoLong
+        return ratio >= 1.5 ? ratio : 2.1
+    }
+
+    private var currentDisplayZoom: Double {
+        guard let device else { return 1 }
+        return LensMath.toDisplay(Double(device.videoZoomFactor), multiplier: multiplier)
+    }
+
+    /// 连续扫码闭环：**一件 = 进框 → 推近 → 读到 → 保持 → 回位 → 等下一件**。
+    ///
+    /// 次序是照正式端要走的流程写的，两条关键差别都在这里：
+    /// ① **推近发生在读到之前**（现在正式端是读到之后才推，那是确认动作，不是搜索动作）；
+    /// ② 读到之后**保持 2 秒**才回退（给录像留一段面单特写）。
+    /// `barcodeSeen` 是这一帧的识码结果（本方法拿不到那个局部变量）。
+    private func continuousTick(now: CFTimeInterval, barcodeSeen: Bool) {
+        switch phase {
+        case .idle:
+            guard let box = smoothedBox else { return }
+            let fill = fillRatio(box)
+            guard fill > 0.02 else { return }
+
+            let current = currentDisplayZoom
+            zoomBefore = current
+            fillBefore = fill
+            cycleStart = now
+            attempts = 0
+            misses = 0
+            lastPayload = ""   // 新的一件：上一件的单号不该把这一次去重掉
+
+            // 1x 就读得到（离得近）：**别推**。这一帧的图是推近之前拍的，
+            // 推了也不会让这一次读得更快，只会白拍一段变焦回到视频里。
+            if barcodeSeen {
+                pushZoom = current
+                cappedByCeiling = false
+                return
+            }
+
+            let ceiling = zoomCeiling
+            let want = min(max(current * (Self.targetFill / fill), current), ceiling)
+            pushZoom = want
+            cappedByCeiling = want >= ceiling - 0.01
+            setZoomImmediate(want)
+
+            phase = .seeking
+            phaseAt = now
+
+        case .seeking:
+            if now - lastLabelAt > Self.rearmAbsence {
+                // 面单拿走了还没读到 —— 这一轮作废，回去等下一件
+                phase = .waitingNew
+                cycleStart = nil
+            } else if now - phaseAt > Self.seekTimeout {
+                // 一直读不到：回退，并且**必须进 waitingNew** —— 直接回 idle 的话
+                // 面单还在框里，下一帧又会推一次，就成了「推 → 读不到 → 推」的死循环。
+                rampTo(baseZoom)
+                phase = .waitingNew
+                cycleStart = nil
+            }
+
+        case .holding:
+            guard now >= holdUntil else { return }
+            let from = currentDisplayZoom
+            rampTo(baseZoom)          // 回退是**录进画面**的，必须缓
+            restoreEndsAt = now + abs(from - baseZoom) / Double(Self.zoomRampRate)
+            phase = .restoring
+            phaseAt = now
+
+        case .restoring:
+            guard now >= restoreEndsAt else { return }
+            phase = .waitingNew
+
+        case .waitingNew:
+            if now - lastLabelAt > Self.rearmAbsence {
+                phase = .idle
+            }
+        }
+    }
+
+    private var phaseName: String {
+        switch phase {
+        case .idle: return "等面单"
+        case .seeking: return "推近读"
+        case .holding: return "保持"
+        case .restoring: return "回退"
+        case .waitingNew: return "等下一件"
+        }
+    }
+
     private var zoomDescription: String {
         guard let device else { return "—" }
         var parts: [String] = []
@@ -453,6 +680,11 @@ final class ScanEngine: NSObject {
         s.rectInfo = lastRectInfo
         s.barcodeInfo = lastBarcodeInfo
         s.visionError = lastVisionError
+        s.phase = phaseName
+        s.fill = smoothedBox.map { fillRatio($0) } ?? 0
+        s.pushZoom = pushZoom
+        s.ceiling = zoomCeiling
+        s.capped = cappedByCeiling
         s.fps = fps
         s.frameW = frameW
         s.frameH = frameH
@@ -652,7 +884,7 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                 internalZoom: Double(device.videoZoomFactor))
         }
 
-        if flags.lensSelect, cycleStart != nil, chosenLens == nil,
+        if flags.lensSelect, !flags.continuous, cycleStart != nil, chosenLens == nil,
            let distance = lastDistance, smoothedBox != nil {
             lensVotes.append(LensMath.lensTarget(distance: distance, ultraWideAvailable: hasUltraWide))
             if lensVotes.count >= 2 {
@@ -667,7 +899,11 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         //
         // 步长是从**当前看到的占比**反算的，不是固定倍数：80cm 和 40cm 需要推的量差一倍，
         // 固定倍数在其中一个距离上必然不够或过头。
-        if flags.preZoom, cycleStart != nil, !preZoomActive, misses >= 2, let box = smoothedBox {
+        if flags.continuous {
+            // 连续扫：推近的触发者是**面单框**，不是「连续两轮没读到」——
+            // 80~100cm 下 1x 是一帧都读不到的，等两轮再推等于白等半秒。
+            continuousTick(now: now, barcodeSeen: !barcodes.isEmpty)
+        } else if flags.preZoom, cycleStart != nil, !preZoomActive, misses >= 2, let box = smoothedBox {
             preZoomActive = true
             let fill = Double(max(box.width, box.height))
             let current = LensMath.toDisplay(Double(device?.videoZoomFactor ?? 1), multiplier: multiplier)
@@ -715,19 +951,34 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             let hadCycle = cycleStart != nil
             let elapsed = hadCycle ? (now - (cycleStart ?? now)) * 1000 : 0
             let attemptCount = hadCycle ? max(attempts - 1, 0) : 0
-            cycleStart = nil
-            attempts = 0
 
-            if preZoomActive {
-                preZoomActive = false
-                rampTo(chosenLens ?? 1.0)
+            // 连续扫：**一件只记一次**（推近之后那第一次）。同一件后续每 0.25 秒
+            // 都会再解出同一串，照单全收就是每个包裹几十条记录。
+            var record = true
+            if flags.continuous {
+                // .idle 里读到 = 1x 就够读，`continuousTick` 那一趟没推近（见那里）。
+                if phase == .seeking || phase == .idle {
+                    phase = .holding
+                    holdUntil = now + Self.holdSeconds
+                    cycleStart = nil
+                    attempts = 0
+                } else {
+                    record = false   // 保持 / 回退 / 等下一件 期间的重复读到
+                }
+            } else {
+                cycleStart = nil
+                attempts = 0
+                if preZoomActive {
+                    preZoomActive = false
+                    rampTo(chosenLens ?? 1.0)
+                }
             }
 
             let duplicate = hit.0 == lastPayload && now - lastPayloadAt < 1.0
             lastPayload = hit.0
             lastPayloadAt = now
 
-            if !duplicate {
+            if record && !duplicate {
                 let snapshot = ScanHit(
                     text: hit.0,
                     box: hit.1,
@@ -736,8 +987,12 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                     at: now,
                     confidence: labelConfidence,
                     distance: lastDistance,
-                    zoom: device.map { LensMath.toDisplay(Double($0.videoZoomFactor), multiplier: multiplier) } ?? 1,
-                    camName: device?.localizedName ?? "—")
+                    zoom: currentDisplayZoom,
+                    camName: device?.localizedName ?? "—",
+                    zoomBefore: zoomBefore,
+                    fillBefore: fillBefore,
+                    fillAtHit: smoothedBox.map { fillRatio($0) } ?? 0,
+                    capped: cappedByCeiling)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.delegate?.engine(self, didHit: snapshot)

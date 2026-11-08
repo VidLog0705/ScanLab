@@ -15,6 +15,14 @@ struct ScanRecord {
     let zoom: Double
     let distance: Double?
     let labelConfidence: Float?
+    /// 连续扫：推近**之前**的倍率与面单占比（占比 = 面单长边 ÷ 取景框边长）。
+    /// 这两个数是判「该推多少」的全部依据 —— 没有它们，读不到时分不清是推少了还是推歪了。
+    let zoomBefore: Double
+    let fillBefore: Double
+    /// 读到那一刻的面单占比。目标 0.65：低于它说明推得不够，高于 0.85 说明快出框了。
+    let fillAtHit: Double
+    /// 推近被「传感器 ÷ 视频」那个物理上限截住了（再推就是插值，不加信息）。
+    let capped: Bool
 }
 
 enum MetricsStore {
@@ -46,7 +54,7 @@ enum MetricsStore {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
-        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度"]
+        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶"]
         for r in records {
             let fields = [
                 "\(r.index)",
@@ -60,6 +68,10 @@ enum MetricsStore {
                 String(format: "%.2f", r.zoom),
                 r.distance.map { String(format: "%.1f", $0 * 100) } ?? "",
                 r.labelConfidence.map { String(format: "%.2f", $0) } ?? "",
+                String(format: "%.2f", r.zoomBefore),
+                String(format: "%.3f", r.fillBefore),
+                String(format: "%.3f", r.fillAtHit),
+                r.capped ? "1" : "0",
             ]
             // 单号不含逗号，但别赌 —— 该加引号就加
             lines.append(fields.map(quote).joined(separator: ","))
