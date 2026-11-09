@@ -268,6 +268,9 @@ final class ScanViewController: UIViewController {
             guard let self else { return }
             var flags = self.engine.flags
             flags[keyPath: key].toggle()
+            // 连续扫唯一的输入就是面单框。绿框关着还拨连续 = 一直停在「等面单」，
+            // 屏幕上不会有任何提示说为什么不动 —— 直接替他把绿框打开。
+            if flags.continuous { flags.labelDetect = true }
             self.engine.flags = flags
             // 连续扫的相位与倍率都归零：中途拨开关不能留一个「推近中」的状态在跑。
             self.engine.resetContinuous()

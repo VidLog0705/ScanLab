@@ -549,16 +549,18 @@ final class ScanEngine: NSObject {
             cycleStart = now
             attempts = 0
             misses = 0
-            lastPayload = ""   // 新的一件：上一件的单号不该把这一次去重掉
 
             // 1x 就读得到（离得近）：**别推**。这一帧的图是推近之前拍的，
             // 推了也不会让这一次读得更快，只会白拍一段变焦回到视频里。
+            // ⚠️ 这里**不能**清 `lastPayload`：清了的话「同一件还在框里」会每帧都记一条。
             if barcodeSeen {
                 pushZoom = current
                 cappedByCeiling = false
                 return
             }
 
+            // 真的要推了 —— 这是新的一件，上一件的单号不该把这一次去重掉。
+            lastPayload = ""
             let ceiling = zoomCeiling
             let want = min(max(current * (Self.targetFill / fill), current), ceiling)
             pushZoom = want
@@ -957,7 +959,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             var record = true
             if flags.continuous {
                 // .idle 里读到 = 1x 就够读，`continuousTick` 那一趟没推近（见那里）。
-                if phase == .seeking || phase == .idle {
+                // ⚠️ 必须**有开件**才记：`cycleStart` 为空时 `.idle` 是「没看到面单框」，
+                // 这时候读到码只是视野里顺便有张码（比如绿框关着），记下来就是每帧一条。
+                if (phase == .seeking || phase == .idle), hadCycle {
                     phase = .holding
                     holdUntil = now + Self.holdSeconds
                     cycleStart = nil
