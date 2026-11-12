@@ -45,6 +45,13 @@ struct ScanRecord {
     let rejected: String
     /// `稳定 0.62` / `对焦中 5/8 0.31`。镜头位置 0 = 无穷远、1 = 最近。
     let focus: String
+    /// 开件时那个绿框的「长边/短边」。**0 或空 = 那一件压根没框住东西。**
+    /// 判「框错了是因为它在包裹上」要靠它：占比 0.851 的框，长宽比 ≥1.55 才过得了面积闸。
+    let boxAspect: Double
+    /// `内2 外1`。格式正确的码有几帧落在绿框内 / 框外。空 = 一次都没解出正确的码。
+    ///
+    /// **`外N > 0` = 定位错了的直接证据**：码已经读出来了，是我们自己的框没罩住它。
+    let codeInBox: String
 }
 
 enum MetricsStore {
@@ -81,7 +88,7 @@ enum MetricsStore {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
         // 新列一律**加在最后**：0.1.8 及以前的 CSV 前 15 列对得上，旧表还能直接对比。
-        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因,条码观察,丢弃的串,对焦"]
+        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因,条码观察,丢弃的串,对焦,框长宽比,码在框内"]
         for r in records {
             let fields = [
                 "\(r.index)",
@@ -106,6 +113,8 @@ enum MetricsStore {
                 r.barcodeSummary,
                 r.rejected,
                 r.focus,
+                r.boxAspect > 0 ? String(format: "%.2f", r.boxAspect) : "",
+                r.codeInBox,
             ]
             // 单号不含逗号，但别赌 —— 该加引号就加
             lines.append(fields.map(quote).joined(separator: ","))

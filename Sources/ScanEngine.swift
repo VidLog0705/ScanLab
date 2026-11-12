@@ -27,6 +27,18 @@ struct ScanFlags {
     /// 拨一下就能对比，不用再出一个包。
     var relaxRect = false
 
+    /// 面单检测改走 `VNDetectDocumentSegmentationRequest` —— 问的是「**这是不是一张纸**」
+    /// 而不是「这是不是个长方形」。
+    ///
+    /// 2026-11-12 第 24/25 件就是矩形那一路认错的实证：框占 0.676 / 0.851（说明框得很大），
+    /// 推近规则判「已经够大」一步没推，8~23 帧里一个码都没看见。**包裹的每一面都是长方形**，
+    /// 长宽比 1.15~2.6、面积 ≤55% 一样过得了筛，矩形检测没有「纸」这个概念。
+    /// 纸张分割是 ML 模型（训练集含 labels / receipts），跑在神经网络引擎上，**只返回一个结果**。
+    ///
+    /// 做成开关而不是两路并联：每帧已经 266ms 把 CPU 吃满，再加一路只会让两路都变慢，
+    /// A/B 就不公平了（同【宽矩】的做法）。
+    var paperDetect = false
+
     /// 界面上的缩写，写进 CSV。改开关顺序不要改这里 —— 这是数据的标签。
     var modeTag: String {
         [
@@ -35,7 +47,7 @@ struct ScanFlags {
             focusOnLabel ? "对焦" : "不对焦",
             continuous ? "连续" : (preZoom ? "预缩放" : "无预缩"),
             lensSelect && !continuous ? "选镜" : "不选镜",
-            labelDetect ? (relaxRect ? "宽矩" : "严矩") : "",
+            labelDetect ? (paperDetect ? "纸框" : (relaxRect ? "宽矩" : "严矩")) : "",
         ].filter { !$0.isEmpty }.joined(separator: "/")
     }
 }
@@ -64,6 +76,14 @@ struct ScanHit {
     let rejected: String
     /// 这一件的对焦状态。见 `cycleFocusSummary`。
     let focus: String
+    /// 开件时那个绿框的「长边/短边」。**0 = 那一件压根没框住东西。**
+    ///
+    /// 2026-11-12 第 24/25 件占比 0.676/0.851：能不能被 `pickLabel` 的面积闸拦下，
+    /// 取决于它的长宽比是多少（0.851 × 短边 ≤ 0.55 要长宽比 ≥1.55），而原来这一格没记 ——
+    /// 「框错了」和「筛选没拦住」就分不清。
+    let aspectBefore: Double
+    /// 这一件里格式正确、且中心落在绿框内 / 框外的帧数。见 `cycleBoxSummary`。
+    let codeInBox: String
 }
 
 /// 一件**没读出来**的记录。
@@ -91,6 +111,10 @@ struct ScanMiss {
     let rejected: String
     /// 这一件的对焦状态。见 `cycleFocusSummary`。
     let focus: String
+    /// 开件时那个绿框的「长边/短边」。0 = 没框住东西。
+    let aspectBefore: Double
+    /// 这一件里格式正确、且中心落在绿框内 / 框外的帧数。见 `cycleBoxSummary`。
+    let codeInBox: String
 }
 
 /// 每 0.2 秒推一次给界面的读数。只在主线程读写。
@@ -239,6 +263,14 @@ final class ScanEngine: NSObject {
     /// 镜头位置 0 = 无穷远、1 = 最近；一直是 0 就说明**根本没对到面单上**。
     private var cycleFocusHunting = 0
     private var cycleLensPosition: Double = -1
+    /// 这一件里「格式正确且码中心在绿框内 / 在框外」的帧数。
+    ///
+    /// 记账从 0.1.11 起只认「码在框内」，所以**「外N」这一格是唯一的证据**：
+    /// 它 > 0 就说明码读到了、是我们自己因为框不对不认 —— 那是定位的错，不是相机的错。
+    private var cycleCodeIn = 0
+    private var cycleCodeOut = 0
+    /// 开件时那个绿框的长/短（0 = 没框）。见 `ScanHit.aspectBefore`。
+    private var aspectBefore: Double = 0
     /// **检出那个框时**的界面倍率。
     ///
     /// 距离必须拿「框和倍率同一时刻」的两个数算。原来用当前的 `videoZoomFactor` 配
@@ -258,6 +290,8 @@ final class ScanEngine: NSObject {
 
     private var phase: Phase = .idle
     private var phaseAt: CFTimeInterval = 0
+    /// 上一次「补一档」的时刻。进 `.seeking` 时归零。见 `seekBumpInterval`。
+    private var lastBumpAt: CFTimeInterval = 0
     private var holdUntil: CFTimeInterval = 0
     private var restoreEndsAt: CFTimeInterval = 0
     /// 回位要退回到的倍率（界面口径）。**开一次会话定一次**，之后不跟着当前值漂。
@@ -317,6 +351,16 @@ final class ScanEngine: NSObject {
 
     /// 一直读不到就叫这一轮作废（面单还举着也认了 —— 总比卡在推近状态强）。
     static let seekTimeout: CFTimeInterval = 6.0
+
+    /// 推过一次还读不到，隔多久再补一档。0.8 秒 ≈ 3 帧（实测每帧 251~267ms）。
+    ///
+    /// **这是推近的第二条理由，不依赖绿框准不准。** 第一条（按占比反算）只有在框真的
+    /// 套在面单上时才成立；框在包裹上时占比是虚高的 —— 2026-11-12 第 24/25 件占比
+    /// 0.676/0.851，规则判「已经够大」一步没推，8~23 帧一个码都没看见。
+    /// 框不准不该让系统停在原地干等。
+    static let seekBumpInterval: CFTimeInterval = 0.8
+    /// 每补一档乘多少。1.0 起 4 档到 2.20（本机上限），走完约 3.2 秒 < 超时 6 秒。
+    static let seekBumpFactor: Double = 1.35
 
     // MARK: - 生命周期
 
@@ -489,7 +533,9 @@ final class ScanEngine: NSObject {
             reason: reason,
             barcodes: cycleBarcodeSummary,
             rejected: cycleRejectedSummary,
-            focus: cycleFocusSummary)
+            focus: cycleFocusSummary,
+            aspectBefore: aspectBefore,
+            codeInBox: cycleBoxSummary)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.engine(self, didMiss: snapshot)
@@ -500,6 +546,7 @@ final class ScanEngine: NSObject {
     private func resetPhase() {
         phase = .idle
         phaseAt = 0
+        lastBumpAt = 0
         holdUntil = 0
         restoreEndsAt = 0
         zoomBefore = 0
@@ -526,6 +573,9 @@ final class ScanEngine: NSObject {
         cycleRejected.removeAll()
         cycleFocusHunting = 0
         cycleLensPosition = -1
+        cycleCodeIn = 0
+        cycleCodeOut = 0
+        aspectBefore = 0
     }
 
     /// `条码观察` 列：这一件每一帧识码器看到了什么，三桶分开数。
@@ -544,6 +594,17 @@ final class ScanEngine: NSObject {
     /// 不是相机的问题 —— 0.1.9 的数据里这条可能性一次都没被排除过。
     private var cycleRejectedSummary: String {
         cycleRejected.joined(separator: " ")
+    }
+
+    /// `码在框内` 列：`内2 外1`。空 = 这一件一次都没解出格式正确的码。
+    ///
+    /// `外N > 0` 是**定位错了的直接证据**：码已经读出来了，是我们自己的框没罩住它。
+    /// 没有这一格，「读不到」和「读到了但不认」在表里长得一模一样。
+    private var cycleBoxSummary: String {
+        var parts: [String] = []
+        if cycleCodeIn > 0 { parts.append("内\(cycleCodeIn)") }
+        if cycleCodeOut > 0 { parts.append("外\(cycleCodeOut)") }
+        return parts.joined(separator: " ")
     }
 
     /// `对焦` 列：`稳定 0.62` / `对焦中 5/8 0.31`。
@@ -683,6 +744,25 @@ final class ScanEngine: NSObject {
         return sidePx > 0 ? longPx / sidePx : 0
     }
 
+    /// 码的中心落在绿框里吗。**记账的唯一几何条件**（另一个是格式闸）。
+    ///
+    /// 开件看的是矩形、记账看的是条码，这两条**原来没有任何关系校验** ——
+    /// 2026-11-12 第 15 件 `处理帧数 2 / 矩形帧数 0 / 结果 读到` 就是：框一帧都没检出，
+    /// 账照样记了。那一条就是「误读」的唯一来路。
+    ///
+    /// `smoothedBox` 丢帧时会冻结 0.5 秒（见第 5 步），超过 0.5 秒就不算框住 ——
+    /// 拿一个停在原地的旧框去认一件新东西，会把刚才那条路重新打开。
+    private func codeInsideLabel(_ code: CGRect, now: CFTimeInterval) -> Bool {
+        // 绿框关着就没有「框内」这个概念，那时候唯一的闸还是格式闸（老行为）。
+        // 不加这一行，【绿框】一关就**什么都记不下来** —— 关掉它是为了测「不靠框」，
+        // 不是为了让这个包罢工。
+        guard flags.labelDetect else { return true }
+        guard let box = smoothedBox, lastLabelAt > 0, now - lastLabelAt <= 0.5 else { return false }
+        // 留 2% 边：码贴在面单边缘时中心压线不算错，绿框本来就是给眼睛看的。
+        return box.insetBy(dx: -0.02, dy: -0.02)
+            .contains(CGPoint(x: code.midX, y: code.midY))
+    }
+
     /// 数码变焦的**物理上限**（界面口径）：传感器长边 ÷ 视频长边。
     ///
     /// 竖屏 1080P 的视频横向 1080 来自传感器，而 16:9 是从 4:3 裁出来的 ——
@@ -711,7 +791,7 @@ final class ScanEngine: NSObject {
     /// 次序是照正式端要走的流程写的，两条关键差别都在这里：
     /// ① **推近发生在读到之前**（现在正式端是读到之后才推，那是确认动作，不是搜索动作）；
     /// ② 读到之后**保持 2 秒**才回退（给录像留一段面单特写）。
-    /// `barcodeSeen` 是这一帧的识码结果（本方法拿不到那个局部变量）。
+    /// `barcodeSeen` 是这一帧「**框内**读到了码」（本方法拿不到那个局部变量）。
     private func continuousTick(now: CFTimeInterval, barcodeSeen: Bool) {
         switch phase {
         case .idle:
@@ -747,6 +827,7 @@ final class ScanEngine: NSObject {
 
             phase = .seeking
             phaseAt = now
+            lastBumpAt = now
 
         case .seeking:
             if now - lastLabelAt > Self.rearmAbsence {
@@ -767,6 +848,21 @@ final class ScanEngine: NSObject {
                 rampTo(baseZoom)
                 phase = .waitingNew
                 cycleStart = nil
+            } else if !barcodeSeen, now - lastBumpAt >= Self.seekBumpInterval {
+                // **第二条推近理由，不依赖框准不准。**
+                // 按占比算的那一步只有在框真的套在面单上时才成立；框在包裹上时占比是
+                // 虚高的，规则就判「已经够大」，一步不推 —— 2026-11-12 第 24/25 件
+                // 占比 0.676/0.851、倍率 1.00、8~23 帧一个码都没看见，就是这么来的。
+                // 所以：推过之后仍然无码，就一档一档往上补，直到物理上限。
+                // 框对的件不受影响（它们推到位那一两帧就读到了）。
+                lastBumpAt = now
+                let ceiling = zoomCeiling
+                if currentDisplayZoom < ceiling - 0.01 {
+                    let next = min(currentDisplayZoom * Self.seekBumpFactor, ceiling)
+                    pushZoom = next
+                    cappedByCeiling = next >= ceiling - 0.01
+                    setZoomImmediate(next)
+                }
             }
 
         case .holding:
@@ -960,20 +1056,31 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         var rectRequest: VNDetectRectanglesRequest?
+        var paperRequest: VNDetectDocumentSegmentationRequest?
         if flags.labelDetect {
-            let request = VNDetectRectanglesRequest()
-            // 放宽检出（门槛太高会连面单一起漏掉）、收紧形状（面单就是 1.5 左右的长方形）。
-            // 挑哪个交给 pickLabel，不要让 Vision 的置信度排序替我们决定。
-            request.maximumObservations = 8
-            request.minimumAspectRatio = 0.5
-            request.maximumAspectRatio = 2.6
-            request.minimumSize = 0.15
-            // 这两项是唯一还带猜测的地方：2026-11-12 的 12 条里 11 条「读到那一帧没有矩形」，
-            // 可能是放大之后边缘变软过不了置信度门槛、也可能是四边形不方过不了 30° 容忍。
-            // 拨【宽矩】当场对比，看命中率动不动 —— 不猜，量。
-            request.minimumConfidence = flags.relaxRect ? 0.3 : 0.5
-            request.quadratureTolerance = flags.relaxRect ? 45 : 30
-            rectRequest = request
+            if flags.paperDetect {
+                // 「这是不是一张纸」。ML 模型，训练集含面单这类标签，跑在神经网络引擎上，
+                // **只返回一个结果** —— 所以 `pickLabel` 那套筛选和兜底在这里用不上。
+                let request = VNDetectDocumentSegmentationRequest()
+                if let revision = VNDetectDocumentSegmentationRequest.supportedRevisions.last {
+                    request.revision = revision
+                }
+                paperRequest = request
+            } else {
+                let request = VNDetectRectanglesRequest()
+                // 放宽检出（门槛太高会连面单一起漏掉）、收紧形状（面单就是 1.5 左右的长方形）。
+                // 挑哪个交给 pickLabel，不要让 Vision 的置信度排序替我们决定。
+                request.maximumObservations = 8
+                request.minimumAspectRatio = 0.5
+                request.maximumAspectRatio = 2.6
+                request.minimumSize = 0.15
+                // 这两项是唯一还带猜测的地方：2026-11-12 的 12 条里 11 条「读到那一帧没有矩形」，
+                // 可能是放大之后边缘变软过不了置信度门槛、也可能是四边形不方过不了 30° 容忍。
+                // 拨【宽矩】当场对比，看命中率动不动 —— 不猜，量。
+                request.minimumConfidence = flags.relaxRect ? 0.3 : 0.5
+                request.quadratureTolerance = flags.relaxRect ? 45 : 30
+                rectRequest = request
+            }
         }
 
         // ⚠️ 条码这一路**单独一次 perform、单独一个 handler**：正式端就是一次一个请求。
@@ -1024,7 +1131,27 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         // 4) 面单（单独一次 perform，见上）
         var labelBox: CGRect?
         var labelConfidence: Float?
-        if let rectRequest {
+        if let paperRequest {
+            let paperHandler: VNImageRequestHandler = cropping
+                ? VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
+                : VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+            var paperError: String?
+            do {
+                try paperHandler.perform([paperRequest])
+            } catch {
+                paperError = String(describing: error)
+            }
+            // 没有候选这回事：**它给什么就是什么**。给不出来就是这一帧没看见纸，
+            // 绿框消失、不开件、等下一帧 —— 这比拿一个凑出来的框往下推近强。
+            let one = paperRequest.results?.first
+            if let one {
+                labelBox = Self.toDisplayed(
+                    one.boundingBox, region: region, width: width, height: height)
+                labelConfidence = one.confidence
+            }
+            lastRectInfo = paperError.map { "抛错 " + $0 }
+                ?? (labelBox.map { "纸框 " + Self.describe($0) } ?? "纸框 0 个")
+        } else if let rectRequest {
             let rectHandler: VNImageRequestHandler = cropping
                 ? VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
                 : VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
@@ -1105,7 +1232,11 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         if flags.continuous {
             // 连续扫：推近的触发者是**面单框**，不是「连续两轮没读到」——
             // 80~100cm 下 1x 是一帧都读不到的，等两轮再推等于白等半秒。
-            continuousTick(now: now, barcodeSeen: !barcodes.isEmpty)
+            // `barcodeSeen` 的口径是「**框内**读到了码」，不是「视野里有码」。
+            // 码在框外等于没读到 —— 那正是要看清楚、要推近的情形。
+            continuousTick(
+                now: now,
+                barcodeSeen: barcodes.contains { codeInsideLabel($0.1, now: now) })
         } else if flags.preZoom, cycleStart != nil, !preZoomActive, misses >= 2, let box = smoothedBox {
             preZoomActive = true
             let fill = Double(max(box.width, box.height))
@@ -1153,6 +1284,8 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         if cycleStart != nil {
             cycleFrames += 1
             if labelBox != nil { cycleRectFrames += 1 }
+            // 开件时那个框的长宽比：只在第一帧有框时抓一次，之后框会跟着抖动。
+            if aspectBefore <= 0, let box = smoothedBox { aspectBefore = Self.aspect(box) }
 
             // 识码观察三桶 + 对焦状态。**这两样是 0.1.10 唯一的新信息** ——
             // 0.1.9 那 19 列里 10 列是算出来的，读不到的原因一格都没记。
@@ -1167,6 +1300,13 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             } else {
                 cyclePayload += 1
             }
+            // 码在不在绿框里。**这是「定位错了」与「相机不行」的分界**，见 `cycleBoxSummary`。
+            let decodedNow = barcodes.filter { Self.looksLikeWaybill($0.0) }
+            if decodedNow.contains(where: { codeInsideLabel($0.1, now: now) }) {
+                cycleCodeIn += 1
+            } else if !decodedNow.isEmpty {
+                cycleCodeOut += 1
+            }
             if let device {
                 if device.isAdjustingFocus { cycleFocusHunting += 1 }
                 cycleLensPosition = Double(device.lensPosition)
@@ -1175,10 +1315,16 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         // 10) 读到单号
         //
-        // 只认**格式对**的串。2026-11-09 真机第 7 条读出 `JT5,($VfF` —— 正文解错一个字符
-        // 照样会被当成真单号去上水印。正式端只在设置里比「最短位数」，没有这一道闸。
-        let validHits = barcodes.filter { Self.looksLikeWaybill($0.0) }
-        lastRejected = validHits.isEmpty ? (barcodes.first?.0 ?? "") : ""
+        // 只认**格式对**、**而且码的中心落在绿框里**的串。
+        // - 格式闸：2026-11-09 真机第 7 条读出 `JT5,($VfF`，正文解错一个字符照样上水印。
+        // - 框内闸（0.1.11）：开件看矩形、记账看条码，**这两条原来没有任何关系校验**——
+        //   2026-11-12 第 15 件 `处理帧数 2 / 矩形帧数 0 / 结果 读到`，框一帧都没检出，
+        //   账照样记了。那就是误读的唯一来路。框错了只让它**慢**（等下一件），不让它**错**。
+        let decoded = barcodes.filter { Self.looksLikeWaybill($0.0) }
+        let validHits = decoded.filter { codeInsideLabel($0.1, now: now) }
+        // `丢弃的串` 只管**格式闸**丢掉的东西。码在框外不算格式问题 —— 那一格必须永远
+        // 等于「读到了、是我们自己丢的」，否则两件完全不同的事会被混成一条。
+        lastRejected = decoded.isEmpty ? (barcodes.first?.0 ?? "") : ""
         // 这一件的「解出正文但被格式闸丢掉」记录。**CSV 里这一格有值 = 相机没问题，
         // 是我们自己丢的** —— 0.1.9 那 7 件失败里这条可能性一次都没被排除过。
         if cycleStart != nil, !lastRejected.isEmpty,
@@ -1243,7 +1389,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                     rectFrames: cycleRectFrames,
                     barcodes: cycleBarcodeSummary,
                     rejected: cycleRejectedSummary,
-                    focus: cycleFocusSummary)
+                    focus: cycleFocusSummary,
+                    aspectBefore: aspectBefore,
+                    codeInBox: cycleBoxSummary)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.delegate?.engine(self, didHit: snapshot)
@@ -1309,15 +1457,16 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
     /// 先按「像面单」（长宽比 + 面积占比）过滤，再在里面挑最大的：
     /// 这样拿到的是面单本体，而不是面单里更小的条码块，也不是外面那个箱子。
     private static func pickLabel(from pool: [(CGRect, Float)]) -> (CGRect, Float)? {
-        let labelLike = pool.filter {
+        // **挑不出来就返回 nil**：不框、不开件、等下一帧。
+        //
+        // 原来的兜底是「一个都不像就用面积最大的那个」。那行代码**保证会框错** ——
+        // 整箱包裹永远比面单大，而包裹的每一面都过得了这个筛（长宽比 1.15~2.6、
+        // 面积 ≤55%），于是框在箱子上、按箱子的尺寸算倍率、推到 1.3x 还是读不到。
+        // 宁可这一帧不动，也不要拿一个错的框往下走。
+        pool.filter {
             labelAspectRange.contains(aspect($0.0))
                 && Double($0.0.width * $0.0.height) <= labelMaxArea
-        }
-        if let best = labelLike.max(by: { $0.0.width * $0.0.height < $1.0.width * $1.0.height }) {
-            return best
-        }
-        // 一个都不像：宁可用大的那个也别让绿框消失，但候选列表已经把事情说清楚了。
-        return pool.max(by: { $0.0.width * $0.0.height < $1.0.width * $1.0.height })
+        }.max(by: { $0.0.width * $0.0.height < $1.0.width * $1.0.height })
     }
 
     /// Vision 的框（裁剪图、左下原点）→ 整幅画面归一化、**左上原点**。

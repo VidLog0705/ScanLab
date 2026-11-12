@@ -194,7 +194,10 @@ final class ScanViewController: UIViewController {
             makeToggle("对焦", key: \.focusOnLabel),
             makeToggle("预缩", key: \.preZoom),
             makeToggle("选镜", key: \.lensSelect),
-            // 矩形检测门槛的 A/B。同一个包拨一下就能比，不用为这一项再出一个包。
+            // 面单检测换一个问题：矩形（"像不像长方形"）↔ 纸张分割（"是不是一张纸"）。
+            // 同一个包拨一下就能比，不用为这一项再出一个包。
+            makeToggle("纸框", key: \.paperDetect),
+            // 矩形检测门槛的 A/B。
             makeToggle("宽矩", key: \.relaxRect),
         ] {
             row.addArrangedSubview(button)
@@ -503,7 +506,9 @@ extension ScanViewController: ScanEngineDelegate {
             reason: "",
             barcodeSummary: hit.barcodes,
             rejected: hit.rejected,
-            focus: hit.focus))
+            focus: hit.focus,
+            boxAspect: hit.aspectBefore,
+            codeInBox: hit.codeInBox))
         pendingDate = nil
         syncStartButton()
         updateActions()
@@ -544,7 +549,9 @@ extension ScanViewController: ScanEngineDelegate {
             reason: miss.reason,
             barcodeSummary: miss.barcodes,
             rejected: miss.rejected,
-            focus: miss.focus))
+            focus: miss.focus,
+            boxAspect: miss.aspectBefore,
+            codeInBox: miss.codeInBox))
         syncStartButton()
         updateActions()
     }
