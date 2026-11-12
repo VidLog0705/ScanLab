@@ -34,6 +34,17 @@ struct ScanRecord {
     let rectFrames: Int
     /// 没读到的原因（读到的那条为空）。
     let reason: String
+    /// 这一件每一帧识码器看到了什么：`无码7` / `无正文3(ITF14无正文)` / `有码1`。
+    ///
+    /// **0.1.10 加的，是把「读不到」定性唯一需要的列。** 0.1.9 那 19 列里
+    /// `处理帧数`、`中间失败轮次`、`倍率`、`推到顶` 全是算出来的（帧数 = 超时 ÷ 266ms），
+    /// 而识码器每一帧的实际观察一格都没记 —— 所以那 7 件失败只能猜。
+    let barcodeSummary: String
+    /// 解出正文但被 `looksLikeWaybill` 丢掉的串（最多 3 个，空格分隔）。
+    /// **有值 = 读到了，是我们自己丢的**，不是相机问题。
+    let rejected: String
+    /// `稳定 0.62` / `对焦中 5/8 0.31`。镜头位置 0 = 无穷远、1 = 最近。
+    let focus: String
 }
 
 enum MetricsStore {
@@ -70,7 +81,7 @@ enum MetricsStore {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
         // 新列一律**加在最后**：0.1.8 及以前的 CSV 前 15 列对得上，旧表还能直接对比。
-        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因"]
+        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因,条码观察,丢弃的串,对焦"]
         for r in records {
             let fields = [
                 "\(r.index)",
@@ -92,6 +103,9 @@ enum MetricsStore {
                 "\(r.frames)",
                 "\(r.rectFrames)",
                 r.reason,
+                r.barcodeSummary,
+                r.rejected,
+                r.focus,
             ]
             // 单号不含逗号，但别赌 —— 该加引号就加
             lines.append(fields.map(quote).joined(separator: ","))

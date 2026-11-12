@@ -58,6 +58,12 @@ struct ScanHit {
     /// 这一件一共处理了几帧、其中几帧真的检出了面单框。见 `ScanMiss.frames`。
     let frames: Int
     let rectFrames: Int
+    /// 这一件每一帧识码器看到了什么。见 `cycleBarcodeSummary`。
+    let barcodes: String
+    /// 这一件被格式闸丢掉的串（最多 3 个）。**有值 = 读到了，是被我们自己丢的。**
+    let rejected: String
+    /// 这一件的对焦状态。见 `cycleFocusSummary`。
+    let focus: String
 }
 
 /// 一件**没读出来**的记录。
@@ -79,6 +85,12 @@ struct ScanMiss {
     let camName: String
     /// 为什么结束：面单走了 / 超时 / 又按了一次【本件开始】。
     let reason: String
+    /// 这一件每一帧识码器看到了什么。见 `cycleBarcodeSummary`。
+    let barcodes: String
+    /// 这一件被格式闸丢掉的串（最多 3 个）。**有值 = 读到了，是被我们自己丢的。**
+    let rejected: String
+    /// 这一件的对焦状态。见 `cycleFocusSummary`。
+    let focus: String
 }
 
 /// 每 0.2 秒推一次给界面的读数。只在主线程读写。
@@ -208,6 +220,25 @@ final class ScanEngine: NSObject {
     /// 本题处理帧数 / 其中检出面单框的帧数。开件时清零。
     private var cycleFrames = 0
     private var cycleRectFrames = 0
+    /// 这一件的逐帧识码观察，三桶分开数。
+    ///
+    /// ⚠️ **这是把「读不到」定性唯一需要的三个数**。2026-11-12 那 7 件失败，
+    /// 表里 19 列有 10 列是算出来的（`帧数` = 超时 ÷ 266ms、`倍率` = 占比反算…），
+    /// 而识码器每一帧看到什么**一格都没记**。三种情况对应三种完全不同的病：
+    /// - `无码` = 根本没看见码 → 对焦/模糊/角度/裁剪
+    /// - `无正文` = 看见了解不出 → 清晰度或码制
+    /// - `有码` = 解出了正文 → 那还读不到，就只可能是 `looksLikeWaybill` 丢的
+    private var cycleNoBarcode = 0
+    private var cycleNoPayload = 0
+    private var cyclePayload = 0
+    /// 第一个「看见码但没正文」的种类（`ITF14无正文`），空 = 没发生过。
+    private var cycleNoPayloadKind = ""
+    /// 被格式闸丢掉的串，最多留 3 个。
+    private var cycleRejected: [String] = []
+    /// 这一件有几帧 `isAdjustingFocus` 为真、以及最后一次的镜头位置。
+    /// 镜头位置 0 = 无穷远、1 = 最近；一直是 0 就说明**根本没对到面单上**。
+    private var cycleFocusHunting = 0
+    private var cycleLensPosition: Double = -1
     /// **检出那个框时**的界面倍率。
     ///
     /// 距离必须拿「框和倍率同一时刻」的两个数算。原来用当前的 `videoZoomFactor` 配
@@ -427,10 +458,7 @@ final class ScanEngine: NSObject {
             // `emitMiss` 自己判 cycleStart，正常的一件读到后它是空的，不会误报。
             self.emitMiss(now, reason: "又按了一次开始")
             self.cycleStart = now
-            self.attempts = 0
-            self.misses = 0
-            self.cycleFrames = 0
-            self.cycleRectFrames = 0
+            self.resetCycleCounters()
             self.preZoomActive = false
             self.chosenLens = nil
             self.lensVotes.removeAll()
@@ -458,7 +486,10 @@ final class ScanEngine: NSObject {
             capped: cappedByCeiling,
             zoom: currentDisplayZoom,
             camName: device?.localizedName ?? "—",
-            reason: reason)
+            reason: reason,
+            barcodes: cycleBarcodeSummary,
+            rejected: cycleRejectedSummary,
+            focus: cycleFocusSummary)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.engine(self, didMiss: snapshot)
@@ -478,16 +509,59 @@ final class ScanEngine: NSObject {
         armedPayload = ""
     }
 
+    /// 清这一件的逐帧计数。**开件 / 收件 / 切开关 / 放弃 全走这一处。**
+    ///
+    /// 原来是五处各写一遍 `attempts = 0; misses = 0; frames = 0; rectFrames = 0`，
+    /// 0.1.10 要再加五格 —— 再散着写必然漏一条。收成一处，加字段只改这里。
+    /// ⚠️ 不动 `cycleStart`：开件和收件的方向正好相反，那个交给调用方。
+    private func resetCycleCounters() {
+        attempts = 0
+        misses = 0
+        cycleFrames = 0
+        cycleRectFrames = 0
+        cycleNoBarcode = 0
+        cycleNoPayload = 0
+        cyclePayload = 0
+        cycleNoPayloadKind = ""
+        cycleRejected.removeAll()
+        cycleFocusHunting = 0
+        cycleLensPosition = -1
+    }
+
+    /// `条码观察` 列：这一件每一帧识码器看到了什么，三桶分开数。
+    private var cycleBarcodeSummary: String {
+        var parts: [String] = []
+        if cycleNoBarcode > 0 { parts.append("无码\(cycleNoBarcode)") }
+        if cycleNoPayload > 0 {
+            let kind = cycleNoPayloadKind.isEmpty ? "" : "(\(cycleNoPayloadKind))"
+            parts.append("无正文\(cycleNoPayload)\(kind)")
+        }
+        if cyclePayload > 0 { parts.append("有码\(cyclePayload)") }
+        return parts.joined(separator: " ")
+    }
+
+    /// `丢弃的串` 列。**这一格有值 = 读到了、是被 `looksLikeWaybill` 丢的**，
+    /// 不是相机的问题 —— 0.1.9 的数据里这条可能性一次都没被排除过。
+    private var cycleRejectedSummary: String {
+        cycleRejected.joined(separator: " ")
+    }
+
+    /// `对焦` 列：`稳定 0.62` / `对焦中 5/8 0.31`。
+    private var cycleFocusSummary: String {
+        guard cycleLensPosition >= 0 else { return "" }
+        let hunt = cycleFocusHunting > 0
+            ? "对焦中 \(cycleFocusHunting)/\(cycleFrames)"
+            : "稳定"
+        return String(format: "%@ %.2f", hunt, cycleLensPosition)
+    }
+
     /// 界面上拨了「连续」开关：相位清零，立刻回到原倍率。
     func resetContinuous() {
         videoQueue.async { [weak self] in
             guard let self else { return }
             self.resetPhase()
             self.cycleStart = nil
-            self.attempts = 0
-            self.misses = 0
-            self.cycleFrames = 0
-            self.cycleRectFrames = 0
+            self.resetCycleCounters()
             self.setZoomImmediate(self.baseZoom)
             self.publishStatus(force: true)
         }
@@ -502,8 +576,7 @@ final class ScanEngine: NSObject {
             guard let self else { return }
             self.emitMiss(CACurrentMediaTime(), reason: "导出前还没读到")
             self.cycleStart = nil
-            self.cycleFrames = 0
-            self.cycleRectFrames = 0
+            self.resetCycleCounters()
             DispatchQueue.main.async { completion() }
         }
     }
@@ -513,10 +586,7 @@ final class ScanEngine: NSObject {
         videoQueue.async { [weak self] in
             guard let self else { return }
             self.cycleStart = nil
-            self.attempts = 0
-            self.misses = 0
-            self.cycleFrames = 0
-            self.cycleRectFrames = 0
+            self.resetCycleCounters()
             self.preZoomActive = false
         }
     }
@@ -656,10 +726,7 @@ final class ScanEngine: NSObject {
             zoomBefore = current
             fillBefore = fill
             cycleStart = now
-            attempts = 0
-            misses = 0
-            cycleFrames = 0
-            cycleRectFrames = 0
+            resetCycleCounters()
 
             // 1x 就读得到（离得近）：**别推**。这一帧的图是推近之前拍的，
             // 推了也不会让这一次读得更快，只会白拍一段变焦回到视频里。
@@ -684,7 +751,13 @@ final class ScanEngine: NSObject {
         case .seeking:
             if now - lastLabelAt > Self.rearmAbsence {
                 // 面单拿走了还没读到 —— 这一轮作废，回去等下一件
+                //
+                // ⚠️ `rampTo(baseZoom)` 是 0.1.10 补的。原来只有「超时」那条分支回位，
+                // 这条不回 —— 于是失败之后倍率就停在推到的位置上，下一件开件时
+                // `zoomBefore` 是个错的数（2026-11-12 第 2、8 件的 2.20 就是这么来的）。
+                // 它只解释得了 23 件里的那一对，剩下 5 件照旧失败，所以这不是那 7 件的病因。
                 emitMiss(now, reason: "面单走了还没读到")
+                rampTo(baseZoom)
                 phase = .waitingNew
                 cycleStart = nil
             } else if now - phaseAt > Self.seekTimeout {
@@ -944,8 +1017,7 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         lastBarcodeInfo = observations.isEmpty
             ? "0 个"
             : observations.map { ob in
-                let name = ob.symbology.rawValue
-                    .replacingOccurrences(of: "VNBarcodeSymbology", with: "")
+                let name = Self.symbologyName(ob)
                 return (ob.payloadStringValue?.isEmpty == false) ? name : name + "无正文"
             }.joined(separator: " ")
 
@@ -1081,6 +1153,24 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         if cycleStart != nil {
             cycleFrames += 1
             if labelBox != nil { cycleRectFrames += 1 }
+
+            // 识码观察三桶 + 对焦状态。**这两样是 0.1.10 唯一的新信息** ——
+            // 0.1.9 那 19 列里 10 列是算出来的，读不到的原因一格都没记。
+            if observations.isEmpty {
+                cycleNoBarcode += 1
+            } else if barcodes.isEmpty {
+                cycleNoPayload += 1
+                if cycleNoPayloadKind.isEmpty,
+                   let bare = observations.first(where: { $0.payloadStringValue?.isEmpty != false }) {
+                    cycleNoPayloadKind = Self.symbologyName(bare)
+                }
+            } else {
+                cyclePayload += 1
+            }
+            if let device {
+                if device.isAdjustingFocus { cycleFocusHunting += 1 }
+                cycleLensPosition = Double(device.lensPosition)
+            }
         }
 
         // 10) 读到单号
@@ -1089,6 +1179,12 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         // 照样会被当成真单号去上水印。正式端只在设置里比「最短位数」，没有这一道闸。
         let validHits = barcodes.filter { Self.looksLikeWaybill($0.0) }
         lastRejected = validHits.isEmpty ? (barcodes.first?.0 ?? "") : ""
+        // 这一件的「解出正文但被格式闸丢掉」记录。**CSV 里这一格有值 = 相机没问题，
+        // 是我们自己丢的** —— 0.1.9 那 7 件失败里这条可能性一次都没被排除过。
+        if cycleStart != nil, !lastRejected.isEmpty,
+           !cycleRejected.contains(lastRejected), cycleRejected.count < 3 {
+            cycleRejected.append(lastRejected)
+        }
 
         if let hit = validHits.first {
             misses = 0
@@ -1144,7 +1240,10 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                     fillAtHit: labelBox != nil ? smoothedBox.map { fillRatio($0) } ?? 0 : nil,
                     capped: cappedByCeiling,
                     frames: cycleFrames,
-                    rectFrames: cycleRectFrames)
+                    rectFrames: cycleRectFrames,
+                    barcodes: cycleBarcodeSummary,
+                    rejected: cycleRejectedSummary,
+                    focus: cycleFocusSummary)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.delegate?.engine(self, didHit: snapshot)
@@ -1180,6 +1279,12 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
     /// 面积 / 长宽比，给屏幕上的候选列表用。
     private static func describe(_ rect: CGRect) -> String {
         String(format: "%.2f/%.1f", Double(rect.width * rect.height), aspect(rect))
+    }
+
+    /// `VNBarcodeSymbologyCode128` → `Code128`。屏幕和 CSV 都用这一个写法。
+    private static func symbologyName(_ observation: VNBarcodeObservation) -> String {
+        observation.symbology.rawValue
+            .replacingOccurrences(of: "VNBarcodeSymbology", with: "")
     }
 
     /// 长得像不像一个运单号：只允许 `A-Z0-9-`，长度 10–24。

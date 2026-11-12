@@ -500,16 +500,21 @@ extension ScanViewController: ScanEngineDelegate {
             miss: false,
             frames: hit.frames,
             rectFrames: hit.rectFrames,
-            reason: ""))
+            reason: "",
+            barcodeSummary: hit.barcodes,
+            rejected: hit.rejected,
+            focus: hit.focus))
         pendingDate = nil
         syncStartButton()
         updateActions()
     }
 
     func engine(_ engine: ScanEngine, didMiss miss: ScanMiss) {
+        // 不再显示「几轮」—— 它恒等于帧数±1，是算出来的。换成识码观察：那才是真的信息。
         resultLabel.text = String(
-            format: "未读到  %.0fms  %d 轮  框 %d/%d 帧  %@",
-            miss.ms, miss.attempts, miss.rectFrames, miss.frames, miss.reason)
+            format: "未读到  %.0fms  框 %d/%d  条码 %@  %@",
+            miss.ms, miss.rectFrames, miss.frames,
+            miss.barcodes.isEmpty ? "—" : miss.barcodes, miss.reason)
 
         // 连续扫没有按钮，任何一件都该落一条；手动模式下只有「按过一次开始」才算数
         // —— `pendingDate` 为空说明这件不是他本次按出来的，别污染样本。
@@ -536,7 +541,10 @@ extension ScanViewController: ScanEngineDelegate {
             miss: true,
             frames: miss.frames,
             rectFrames: miss.rectFrames,
-            reason: miss.reason))
+            reason: miss.reason,
+            barcodeSummary: miss.barcodes,
+            rejected: miss.rejected,
+            focus: miss.focus))
         syncStartButton()
         updateActions()
     }
