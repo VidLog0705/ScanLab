@@ -90,7 +90,9 @@ enum MetricsStore {
         // 新列一律**加在最后**：0.1.8 及以前的 CSV 前 15 列对得上，旧表还能直接对比。
         var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因,条码观察,丢弃的串,对焦,框长宽比,码在框内"]
         for r in records {
-            let fields = [
+            // 显式写类型：24 个字面量放一起，类型推断会超时（2026-11-12 实测编译报
+            // "unable to type-check this expression in reasonable time"）。
+            let fields: [String] = [
                 "\(r.index)",
                 formatter.string(from: r.at),
                 String(format: "%.0f", r.ms),
