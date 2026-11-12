@@ -194,6 +194,8 @@ final class ScanViewController: UIViewController {
             makeToggle("对焦", key: \.focusOnLabel),
             makeToggle("预缩", key: \.preZoom),
             makeToggle("选镜", key: \.lensSelect),
+            // 矩形检测门槛的 A/B。同一个包拨一下就能比，不用为这一项再出一个包。
+            makeToggle("宽矩", key: \.relaxRect),
         ] {
             row.addArrangedSubview(button)
         }
@@ -348,6 +350,11 @@ final class ScanViewController: UIViewController {
         if let lens = s.chosenLens { label += String(format: "  选镜 %.1fx", lens) }
         if s.preZoomed { label += "  预缩中" }
         label += "  空转 \(s.misses) 轮"
+        // 矩形命中率：这一件处理了几帧、其中几帧真的检出了面单框。
+        // 「读到那一帧没有矩形」在 2026-11-12 是 12 条占 11 条 —— 这个分母就是拿来定位的。
+        if s.cycleFrames > 0 {
+            label += String(format: "  框 %d/%d 帧", s.cycleRectFrames, s.cycleFrames)
+        }
         lines.append(label)
 
         // 连续扫这一行是**判据**：占比决定推多少，上限决定推到底有没有用。
@@ -426,10 +433,19 @@ final class ScanViewController: UIViewController {
     }
 
     @objc private func exportCSV() {
+        // 先把「开着还没读到」的那一件收成一条「未读到」，再写表 ——
+        // 否则放弃的那几件在 CSV 里连一行都没有，看着像没测过。
+        engine.closeOpenCycle { [weak self] in
+            self?.presentExport()
+        }
+    }
+
+    private func presentExport() {
         guard !records.isEmpty else {
             resultLabel.text = "还没有数据：先按【本件开始】打几件"
             return
         }
+        updateActions()
         guard let url = MetricsStore.write(records) else {
             resultLabel.text = "写不出 CSV，检查存储空间"
             return
@@ -480,8 +496,47 @@ extension ScanViewController: ScanEngineDelegate {
             zoomBefore: hit.zoomBefore,
             fillBefore: hit.fillBefore,
             fillAtHit: hit.fillAtHit,
-            capped: hit.capped))
+            capped: hit.capped,
+            miss: false,
+            frames: hit.frames,
+            rectFrames: hit.rectFrames,
+            reason: ""))
         pendingDate = nil
+        syncStartButton()
+        updateActions()
+    }
+
+    func engine(_ engine: ScanEngine, didMiss miss: ScanMiss) {
+        resultLabel.text = String(
+            format: "未读到  %.0fms  %d 轮  框 %d/%d 帧  %@",
+            miss.ms, miss.attempts, miss.rectFrames, miss.frames, miss.reason)
+
+        // 连续扫没有按钮，任何一件都该落一条；手动模式下只有「按过一次开始」才算数
+        // —— `pendingDate` 为空说明这件不是他本次按出来的，别污染样本。
+        guard pendingDate != nil || engine.flags.continuous else { return }
+
+        // ⚠️ 不动 `pendingDate`：`beginCycle()` 是先设时间再进队列的，
+        // 这条 miss 是在那之后才回来的，清了会把**新**那一件的计时起点抹掉。
+        records.append(ScanRecord(
+            index: records.count + 1,
+            at: Date().addingTimeInterval(-miss.ms / 1000),
+            ms: miss.ms,
+            attempts: miss.attempts,
+            text: "",
+            orientation: orientationName,
+            mode: engine.flags.modeTag,
+            camName: miss.camName,
+            zoom: miss.zoom,
+            distance: nil,
+            labelConfidence: nil,
+            zoomBefore: miss.zoomBefore,
+            fillBefore: miss.fillBefore,
+            fillAtHit: nil,
+            capped: miss.capped,
+            miss: true,
+            frames: miss.frames,
+            rectFrames: miss.rectFrames,
+            reason: miss.reason))
         syncStartButton()
         updateActions()
     }

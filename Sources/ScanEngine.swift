@@ -20,6 +20,12 @@ struct ScanFlags {
     ///
     /// 打开后 `preZoom` / `lensSelect` 自动让位（两套变焦逻辑同时在跑，倍率是谁改的都查不出来）。
     var continuous = false
+    /// 放宽矩形检测门槛（置信度 0.5→0.3、四边形容忍 30→45）。
+    ///
+    /// 单独做成开关是为了**同一个包内 A/B**：2026-11-12 的 12 条记录里 11 条
+    /// 「读到那一帧没有矩形」，但分不清是检测本身不行还是被这套门槛筛掉了。
+    /// 拨一下就能对比，不用再出一个包。
+    var relaxRect = false
 
     /// 界面上的缩写，写进 CSV。改开关顺序不要改这里 —— 这是数据的标签。
     var modeTag: String {
@@ -29,7 +35,8 @@ struct ScanFlags {
             focusOnLabel ? "对焦" : "不对焦",
             continuous ? "连续" : (preZoom ? "预缩放" : "无预缩"),
             lensSelect && !continuous ? "选镜" : "不选镜",
-        ].joined(separator: "/")
+            labelDetect ? (relaxRect ? "宽矩" : "严矩") : "",
+        ].filter { !$0.isEmpty }.joined(separator: "/")
     }
 }
 
@@ -48,6 +55,30 @@ struct ScanHit {
     /// 读到那一刻的面单占比。**nil = 那一帧没检出矩形**（测不到，不是 0）。
     let fillAtHit: Double?
     let capped: Bool
+    /// 这一件一共处理了几帧、其中几帧真的检出了面单框。见 `ScanMiss.frames`。
+    let frames: Int
+    let rectFrames: Int
+}
+
+/// 一件**没读出来**的记录。
+///
+/// 2026-11-12 需求方：「实际有两条面单没读出来」—— 而 CSV 里一条都没有，
+/// 因为原来只记读到的。**失败的件才是要解释的东西**，抹掉之后表看着全绿、
+/// 现场却是漏读，这种表最没用。
+struct ScanMiss {
+    let ms: Double
+    let attempts: Int
+    /// 这一件一共处理了几帧、其中几帧检出了面单框。
+    /// **判据**：命中率在推近之后塌掉 = 放大把矩形框打没了；从头就低 = 检测本身不行。
+    let frames: Int
+    let rectFrames: Int
+    let zoomBefore: Double
+    let fillBefore: Double
+    let capped: Bool
+    let zoom: Double
+    let camName: String
+    /// 为什么结束：面单走了 / 超时 / 又按了一次【本件开始】。
+    let reason: String
 }
 
 /// 每 0.2 秒推一次给界面的读数。只在主线程读写。
@@ -90,10 +121,15 @@ struct EngineStatus {
     var capped = false
     /// 读到了但格式不对、被丢弃的串（空 = 没有）。
     var rejected: String = ""
+    /// 这一件处理了几帧、其中几帧检出面单框。
+    var cycleFrames = 0
+    var cycleRectFrames = 0
 }
 
 protocol ScanEngineDelegate: AnyObject {
     func engine(_ engine: ScanEngine, didHit hit: ScanHit)
+    /// 一件读不到就结束了。**必须上报** —— 否则 CSV 里只剩成功的那部分。
+    func engine(_ engine: ScanEngine, didMiss miss: ScanMiss)
     /// 绿框（画面归一化、原点左上）；nil = 这一帧没看到面单。
     func engine(_ engine: ScanEngine, didSeeLabel box: CGRect?, confidence: Float?)
     /// 焦点十字该画在哪（画面归一化、原点左上）；nil = 不画。
@@ -169,6 +205,15 @@ final class ScanEngine: NSObject {
     private var lastThumbAt: CFTimeInterval = 0
     private var lastPayload = ""
     private var lastPayloadAt: CFTimeInterval = 0
+    /// 本题处理帧数 / 其中检出面单框的帧数。开件时清零。
+    private var cycleFrames = 0
+    private var cycleRectFrames = 0
+    /// **检出那个框时**的界面倍率。
+    ///
+    /// 距离必须拿「框和倍率同一时刻」的两个数算。原来用当前的 `videoZoomFactor` 配
+    /// 冻结的旧框：推近之后框不再更新（矩形丢了），倍率却已经是推后的 ——
+    /// 算出来的距离正好偏大一个倍率。2026-11-12 的 271cm 就是这么来的。
+    private var boxZoom: Double = 1.0
 
     // MARK: 连续扫的相位（只在 videoQueue 里读写）
 
@@ -377,9 +422,15 @@ final class ScanEngine: NSObject {
     func beginCycle() {
         videoQueue.async { [weak self] in
             guard let self else { return }
-            self.cycleStart = CACurrentMediaTime()
+            let now = CACurrentMediaTime()
+            // 上一件还没读到就又按了一次 —— 那一件得留一条「未读到」。
+            // `emitMiss` 自己判 cycleStart，正常的一件读到后它是空的，不会误报。
+            self.emitMiss(now, reason: "又按了一次开始")
+            self.cycleStart = now
             self.attempts = 0
             self.misses = 0
+            self.cycleFrames = 0
+            self.cycleRectFrames = 0
             self.preZoomActive = false
             self.chosenLens = nil
             self.lensVotes.removeAll()
@@ -388,6 +439,29 @@ final class ScanEngine: NSObject {
             self.resetPhase()
             self.rampTo(1.0)
             self.publishStatus(force: true)
+        }
+    }
+
+    /// 把当前这一件当「没读到」收尾。没有在跑的一件就什么都不做。
+    ///
+    /// ⚠️ 调用方负责在调用之后清 `cycleStart` —— 这里只读不写，
+    /// 免得「超时」和「面单走了」两条路径各写一遍清场逻辑、早晚漏一条。
+    private func emitMiss(_ now: CFTimeInterval, reason: String) {
+        guard let start = cycleStart else { return }
+        let snapshot = ScanMiss(
+            ms: (now - start) * 1000,
+            attempts: max(attempts - 1, 0),
+            frames: cycleFrames,
+            rectFrames: cycleRectFrames,
+            zoomBefore: zoomBefore,
+            fillBefore: fillBefore,
+            capped: cappedByCeiling,
+            zoom: currentDisplayZoom,
+            camName: device?.localizedName ?? "—",
+            reason: reason)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.engine(self, didMiss: snapshot)
         }
     }
 
@@ -412,8 +486,25 @@ final class ScanEngine: NSObject {
             self.cycleStart = nil
             self.attempts = 0
             self.misses = 0
+            self.cycleFrames = 0
+            self.cycleRectFrames = 0
             self.setZoomImmediate(self.baseZoom)
             self.publishStatus(force: true)
+        }
+    }
+
+    /// 导表前把「开着但没读到」的那一件收掉，收完再回调（主线程）。
+    ///
+    /// 不收的话：摆 20 件、表里 18 条 —— 缺的那两件到底是没读出来还是压根没测，
+    /// 从表上看不出来。2026-11-12 需求方报的正是这个：两条没读出来，表里一条都没有。
+    func closeOpenCycle(_ completion: @escaping () -> Void) {
+        videoQueue.async { [weak self] in
+            guard let self else { return }
+            self.emitMiss(CACurrentMediaTime(), reason: "导出前还没读到")
+            self.cycleStart = nil
+            self.cycleFrames = 0
+            self.cycleRectFrames = 0
+            DispatchQueue.main.async { completion() }
         }
     }
 
@@ -424,6 +515,8 @@ final class ScanEngine: NSObject {
             self.cycleStart = nil
             self.attempts = 0
             self.misses = 0
+            self.cycleFrames = 0
+            self.cycleRectFrames = 0
             self.preZoomActive = false
         }
     }
@@ -565,6 +658,8 @@ final class ScanEngine: NSObject {
             cycleStart = now
             attempts = 0
             misses = 0
+            cycleFrames = 0
+            cycleRectFrames = 0
 
             // 1x 就读得到（离得近）：**别推**。这一帧的图是推近之前拍的，
             // 推了也不会让这一次读得更快，只会白拍一段变焦回到视频里。
@@ -589,11 +684,13 @@ final class ScanEngine: NSObject {
         case .seeking:
             if now - lastLabelAt > Self.rearmAbsence {
                 // 面单拿走了还没读到 —— 这一轮作废，回去等下一件
+                emitMiss(now, reason: "面单走了还没读到")
                 phase = .waitingNew
                 cycleStart = nil
             } else if now - phaseAt > Self.seekTimeout {
                 // 一直读不到：回退，并且**必须进 waitingNew** —— 直接回 idle 的话
                 // 面单还在框里，下一帧又会推一次，就成了「推 → 读不到 → 推」的死循环。
+                emitMiss(now, reason: "超时")
                 rampTo(baseZoom)
                 phase = .waitingNew
                 cycleStart = nil
@@ -711,6 +808,8 @@ final class ScanEngine: NSObject {
         s.ceiling = zoomCeiling
         s.capped = cappedByCeiling
         s.rejected = lastRejected
+        s.cycleFrames = cycleFrames
+        s.cycleRectFrames = cycleRectFrames
         s.fps = fps
         s.frameW = frameW
         s.frameH = frameH
@@ -796,8 +895,11 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             request.minimumAspectRatio = 0.5
             request.maximumAspectRatio = 2.6
             request.minimumSize = 0.15
-            request.minimumConfidence = 0.5
-            request.quadratureTolerance = 30
+            // 这两项是唯一还带猜测的地方：2026-11-12 的 12 条里 11 条「读到那一帧没有矩形」，
+            // 可能是放大之后边缘变软过不了置信度门槛、也可能是四边形不方过不了 30° 容忍。
+            // 拨【宽矩】当场对比，看命中率动不动 —— 不猜，量。
+            request.minimumConfidence = flags.relaxRect ? 0.3 : 0.5
+            request.quadratureTolerance = flags.relaxRect ? 45 : 30
             rectRequest = request
         }
 
@@ -896,6 +998,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             smoothedConfidence = labelConfidence
             lastLabelAt = now
+            // 框和倍率必须成对记。推近之后矩形常常就检不到了，`smoothedBox` 会一直冻着，
+            // 而 `videoZoomFactor` 已经是新的 —— 拿这两个数算距离，误差正好是一个倍率。
+            boxZoom = currentDisplayZoom
         } else if now - lastLabelAt > 0.5 {
             smoothedBox = nil
             smoothedConfidence = nil
@@ -907,7 +1012,7 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             lastDistance = LensMath.estimateDistance(
                 longFraction: longFraction,
                 hFovDegrees: Double(device.activeFormat.videoFieldOfView),
-                internalZoom: Double(device.videoZoomFactor))
+                internalZoom: LensMath.toInternal(boxZoom, multiplier: multiplier))
         }
 
         if flags.lensSelect, !flags.continuous, cycleStart != nil, chosenLens == nil,
@@ -970,6 +1075,14 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             self.delegate?.engine(self, didSeeLabel: boxForUI, confidence: confidenceForUI)
         }
 
+        // 9.5) 矩形命中率。**必须在第 10 步之前**：读到时 `cycleStart` 会被清掉。
+        // 这一格是判「矩形检测到底多差」的唯一量：命中率在推近之后塌掉 ⇒ 放大把框打没了；
+        // 从头就低 ⇒ 检测本身不行。2026-11-12 那 12 条只能看出「读到那帧没有」，看不出过程。
+        if cycleStart != nil {
+            cycleFrames += 1
+            if labelBox != nil { cycleRectFrames += 1 }
+        }
+
         // 10) 读到单号
         //
         // 只认**格式对**的串。2026-11-09 真机第 7 条读出 `JT5,($VfF` —— 正文解错一个字符
@@ -1029,7 +1142,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                     // 当帧没检出矩形时**必须记空**，不能拿 `smoothedBox` 里冻结的旧值充数：
                     // 2026-11-09 那七条 `读到占比` 和 `推前占比` 三位小数全相等，就是冻结值冒充的。
                     fillAtHit: labelBox != nil ? smoothedBox.map { fillRatio($0) } ?? 0 : nil,
-                    capped: cappedByCeiling)
+                    capped: cappedByCeiling,
+                    frames: cycleFrames,
+                    rectFrames: cycleRectFrames)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.delegate?.engine(self, didHit: snapshot)

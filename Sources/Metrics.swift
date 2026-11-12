@@ -24,24 +24,38 @@ struct ScanRecord {
     let fillAtHit: Double?
     /// 推近被「传感器 ÷ 视频」那个物理上限截住了（再推就是插值，不加信息）。
     let capped: Bool
+    /// 这一件**读到没有**。`false` 的行没有单号、没有耗时意义 —— 它们是**没读到**的那几件。
+    ///
+    /// 2026-11-12 需求方：「实际有两条面单没读出来」，而表里一条都没有 ——
+    /// 原来只记成功的。失败的件才是要解释的东西，抹掉之后表看着全绿、现场却在漏读。
+    let miss: Bool
+    /// 这一件一共处理了几帧、其中几帧检出了面单框。判「矩形检测差在哪」就靠这两格。
+    let frames: Int
+    let rectFrames: Int
+    /// 没读到的原因（读到的那条为空）。
+    let reason: String
 }
 
 enum MetricsStore {
     static func summary(_ records: [ScanRecord]) -> String {
         guard !records.isEmpty else { return "还没有数据" }
-        let values = records.map(\.ms).sorted()
+        // 耗时只能统计**读到**的那些。把未读到的算进去，P50 会被拖成没有意义的数。
+        let hits = records.filter { !$0.miss }
+        let missText = hits.count == records.count ? "" : "  未读到 \(records.count - hits.count)"
+        guard !hits.isEmpty else { return "0 件读到" + missText }
+        let values = hits.map(\.ms).sorted()
         let p50 = percentile(values, 0.5)
         let p90 = percentile(values, 0.9)
         let mean = values.reduce(0, +) / Double(values.count)
-        let firstTry = records.filter { $0.attempts == 0 }.count
+        let firstTry = hits.filter { $0.attempts == 0 }.count
         return String(
             format: "n=%d  P50 %.0fms  P90 %.0fms  均值 %.0fms  一轮中 %d%%",
-            records.count,
+            hits.count,
             p50,
             p90,
             mean,
-            Int((Double(firstTry) / Double(records.count) * 100).rounded())
-        )
+            Int((Double(firstTry) / Double(hits.count) * 100).rounded())
+        ) + missText
     }
 
     static func percentile(_ sorted: [Double], _ p: Double) -> Double {
@@ -55,7 +69,8 @@ enum MetricsStore {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
-        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶"]
+        // 新列一律**加在最后**：0.1.8 及以前的 CSV 前 15 列对得上，旧表还能直接对比。
+        var lines = ["序号,时间,耗时ms,中间失败轮次,单号,方向,开关组合,镜头,倍率,估计距离cm,面单置信度,推前倍率,推前占比,读到占比,推到顶,结果,处理帧数,矩形帧数,未读到原因"]
         for r in records {
             let fields = [
                 "\(r.index)",
@@ -73,6 +88,10 @@ enum MetricsStore {
                 String(format: "%.3f", r.fillBefore),
                 r.fillAtHit.map { String(format: "%.3f", $0) } ?? "",
                 r.capped ? "1" : "0",
+                r.miss ? "未读到" : "读到",
+                "\(r.frames)",
+                "\(r.rectFrames)",
+                r.reason,
             ]
             // 单号不含逗号，但别赌 —— 该加引号就加
             lines.append(fields.map(quote).joined(separator: ","))
