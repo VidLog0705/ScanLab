@@ -364,6 +364,11 @@ final class ScanViewController: UIViewController {
         if !s.visionError.isEmpty {
             lines.append("⚠️ 识码抛错 " + s.visionError)
         }
+        // 读到了但格式不对被丢弃的串。必须看得见 —— 否则「丢了一条真面单」
+        // 和「根本没读到」在屏幕上长得一模一样。
+        if !s.rejected.isEmpty {
+            lines.append("⚠️ 丢弃不合格式：" + s.rejected)
+        }
 
         if !records.isEmpty {
             lines.append("\(records.count) 件  " + MetricsStore.summary(records))

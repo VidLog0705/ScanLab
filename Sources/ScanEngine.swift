@@ -45,7 +45,8 @@ struct ScanHit {
     let camName: String
     let zoomBefore: Double
     let fillBefore: Double
-    let fillAtHit: Double
+    /// 读到那一刻的面单占比。**nil = 那一帧没检出矩形**（测不到，不是 0）。
+    let fillAtHit: Double?
     let capped: Bool
 }
 
@@ -87,6 +88,8 @@ struct EngineStatus {
     var ceiling: Double = 0
     /// 本轮是否被上限截住了。
     var capped = false
+    /// 读到了但格式不对、被丢弃的串（空 = 没有）。
+    var rejected: String = ""
 }
 
 protocol ScanEngineDelegate: AnyObject {
@@ -160,6 +163,9 @@ final class ScanEngine: NSObject {
     private var lastRectInfo = "—"
     private var lastBarcodeInfo = "—"
     private var lastVisionError = ""
+    /// 最近一次「读到了但格式不对」的串。空 = 没有。**不许静默**：丢了一条真面单
+    /// 和「没读到」在屏幕上长得一样的话，测出来的数就解释不了。
+    private var lastRejected = ""
     private var lastThumbAt: CFTimeInterval = 0
     private var lastPayload = ""
     private var lastPayloadAt: CFTimeInterval = 0
@@ -184,6 +190,8 @@ final class ScanEngine: NSObject {
     private var fillBefore: Double = 0
     private var pushZoom: Double = 0
     private var cappedByCeiling = false
+    /// 这一轮记下的那个单号。重臂时拿它跟当前读到的码比 —— **号码变了才算换了一件**。
+    private var armedPayload = ""
 
     /// 识别间隔。正式端 0.3s；这里 0.25s —— 测的是「多久能读到」，粒度粗了量不准。
     static let workInterval: CFTimeInterval = 0.25
@@ -224,8 +232,12 @@ final class ScanEngine: NSObject {
     static let holdSeconds: CFTimeInterval = 2.0
 
     /// 面单要**看不见**多久才算这一件走了（下一件的入口）。
-    /// 太短：识码器偶发漏一帧就把同一件当成新的一件；太长：换件后要干等。
-    static let rearmAbsence: CFTimeInterval = 0.75
+    ///
+    /// 取 2.0 秒，与正式端 `absenceThreshold` 同一口径。原来写的 0.75 秒是错的：
+    /// 2026-11-09 真机一个完全静止的包裹被记了 5 条 —— 矩形检测在静止面单上会抖，
+    /// 抖一下 0.75 秒就过去了。**换件不算慢**：换件走的是「单号变了」那条路，立刻重臂，
+    /// 这个 2 秒只管「同一件又回来了」。
+    static let rearmAbsence: CFTimeInterval = 2.0
 
     /// 一直读不到就叫这一轮作废（面单还举着也认了 —— 总比卡在推近状态强）。
     static let seekTimeout: CFTimeInterval = 6.0
@@ -389,6 +401,7 @@ final class ScanEngine: NSObject {
         fillBefore = 0
         pushZoom = 0
         cappedByCeiling = false
+        armedPayload = ""
     }
 
     /// 界面上拨了「连续」开关：相位清零，立刻回到原倍率。
@@ -540,6 +553,9 @@ final class ScanEngine: NSObject {
         switch phase {
         case .idle:
             guard let box = smoothedBox else { return }
+            // 这一帧必须真的检出矩形。`smoothedBox` 丢帧时会冻结 0.5 秒，
+            // 拿冻结值去算要推多少，就是拿一个测不出来的数当输入。
+            guard now - lastLabelAt <= 0.3 else { return }
             let fill = fillRatio(box)
             guard fill > 0.02 else { return }
 
@@ -596,8 +612,15 @@ final class ScanEngine: NSObject {
             phase = .waitingNew
 
         case .waitingNew:
-            if now - lastLabelAt > Self.rearmAbsence {
-                phase = .idle
+            // 重臂的判据是「换了一件」，**不是「矩形消失了一会儿」**。
+            // ⚠️ 2026-11-09 真机：一个完全静止的包裹被记了 5 条（间隔 4/6/16/8 秒，
+            // 正好是保持 2s + 回退 1.2s + 重新检出）。根因是矩形检测在静止面单上会抖，
+            // 抖一下就被当成「这件走了」。修法是拿**单号**当身份，不是拿框。
+            if !lastPayload.isEmpty, lastPayload != armedPayload {
+                phase = .idle            // 单号换了 = 换了一件
+            } else if now - lastLabelAt > Self.rearmAbsence,
+                      now - lastPayloadAt > Self.rearmAbsence {
+                phase = .idle            // 框和码都静默了 = 这件拿走了
             }
         }
     }
@@ -687,6 +710,7 @@ final class ScanEngine: NSObject {
         s.pushZoom = pushZoom
         s.ceiling = zoomCeiling
         s.capped = cappedByCeiling
+        s.rejected = lastRejected
         s.fps = fps
         s.frameW = frameW
         s.frameH = frameH
@@ -947,7 +971,13 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         // 10) 读到单号
-        if let hit = barcodes.first {
+        //
+        // 只认**格式对**的串。2026-11-09 真机第 7 条读出 `JT5,($VfF` —— 正文解错一个字符
+        // 照样会被当成真单号去上水印。正式端只在设置里比「最短位数」，没有这一道闸。
+        let validHits = barcodes.filter { Self.looksLikeWaybill($0.0) }
+        lastRejected = validHits.isEmpty ? (barcodes.first?.0 ?? "") : ""
+
+        if let hit = validHits.first {
             misses = 0
             // 没有计时（闲着随手扫到）就不要报「几百轮」—— attempts 一直累加着。
             let hadCycle = cycleStart != nil
@@ -983,6 +1013,7 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
             lastPayloadAt = now
 
             if record && !duplicate {
+                if flags.continuous { armedPayload = hit.0 }
                 let snapshot = ScanHit(
                     text: hit.0,
                     box: hit.1,
@@ -995,7 +1026,9 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                     camName: device?.localizedName ?? "—",
                     zoomBefore: zoomBefore,
                     fillBefore: fillBefore,
-                    fillAtHit: smoothedBox.map { fillRatio($0) } ?? 0,
+                    // 当帧没检出矩形时**必须记空**，不能拿 `smoothedBox` 里冻结的旧值充数：
+                    // 2026-11-09 那七条 `读到占比` 和 `推前占比` 三位小数全相等，就是冻结值冒充的。
+                    fillAtHit: labelBox != nil ? smoothedBox.map { fillRatio($0) } ?? 0 : nil,
                     capped: cappedByCeiling)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
@@ -1032,6 +1065,22 @@ extension ScanEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
     /// 面积 / 长宽比，给屏幕上的候选列表用。
     private static func describe(_ rect: CGRect) -> String {
         String(format: "%.2f/%.1f", Double(rect.width * rect.height), aspect(rect))
+    }
+
+    /// 长得像不像一个运单号：只允许 `A-Z0-9-`，长度 10–24。
+    ///
+    /// 依据是 2026-11-09 真机第 7 条读出的 `JT5,($VfF` —— Code 128 解错几个字符
+    /// 不会报错，只会给你一串看着像的乱码。**正式端没有这道闸**（只比「最短位数」），
+    /// 这串会被原样上水印。这里先立一节，测出来能不能挡住再决定正式端要不要抄。
+    ///
+    /// 允许 `-`：京东面单是 `JDX060247420440-1-1-`（正式端会把尾部序号剥掉，这里不剥）。
+    /// 长度按归一化之后的字符数算（去空白、转大写），与服务端同一口径。
+    static func looksLikeWaybill(_ raw: String) -> Bool {
+        let s = String(raw.filter { !$0.isWhitespace }).uppercased()
+        guard (10...24).contains(s.count) else { return false }
+        return s.allSatisfy { c in
+            c.isASCII && (c.isLetter || c.isNumber || c == "-")
+        }
     }
 
     /// 从候选里挑面单。

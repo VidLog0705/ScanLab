@@ -20,7 +20,8 @@ struct ScanRecord {
     let zoomBefore: Double
     let fillBefore: Double
     /// 读到那一刻的面单占比。目标 0.65：低于它说明推得不够，高于 0.85 说明快出框了。
-    let fillAtHit: Double
+    /// **nil = 那一帧没检出矩形**（量不到），和「量到 0」是两回事 —— CSV 里留空。
+    let fillAtHit: Double?
     /// 推近被「传感器 ÷ 视频」那个物理上限截住了（再推就是插值，不加信息）。
     let capped: Bool
 }
@@ -70,7 +71,7 @@ enum MetricsStore {
                 r.labelConfidence.map { String(format: "%.2f", $0) } ?? "",
                 String(format: "%.2f", r.zoomBefore),
                 String(format: "%.3f", r.fillBefore),
-                String(format: "%.3f", r.fillAtHit),
+                r.fillAtHit.map { String(format: "%.3f", $0) } ?? "",
                 r.capped ? "1" : "0",
             ]
             // 单号不含逗号，但别赌 —— 该加引号就加
